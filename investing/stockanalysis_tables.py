@@ -57,6 +57,17 @@ def parse_table_data(html_content):
     return headers, rows
 
 
+def clean_headers(headers):
+    # Find the index of 'Period Ending'
+
+    cleaned = False
+    if 'Period Ending' in headers:
+        index = headers.index('Period Ending')
+        # Slice the list to include only the headers before 'Period Ending'
+        headers = headers[:index]
+        cleaned = True
+    return headers, cleaned
+
 # Main function to get the S&P 500 table data
 def get_data_table(url):
     # Fetch the page content
@@ -65,10 +76,18 @@ def get_data_table(url):
     if html_content:
         # Parse the table data
         headers, table_data = parse_table_data(html_content)
+        headers, cleaned = clean_headers(headers) # throw second row of categories
 
         # Convert the table data to a pandas DataFrame
         df = pd.DataFrame(table_data, columns=headers)
         df.rename(columns={'Company Name': 'Company'}, inplace=True)
+
+        if cleaned:
+            # Drop the row with index 0
+            ratios_cleaned = df.drop(index=0)
+
+            # Reset index if needed
+            ratios_cleaned.reset_index(drop=True, inplace=True)
 
         return df
     else:
@@ -85,7 +104,8 @@ def get_company_financials_as_df(ticker):
         'ratios': f"https://stockanalysis.com/stocks/{ticker}/financials/ratios/"
     }
 
-    return {key: get_data_table(url) for key, url in financials_urls.items()}
+    df = {key: get_data_table(url) for key, url in financials_urls.items()}
+    return df
 
 
 def get_full_data_from_table_dfs(comp_df):
@@ -98,10 +118,10 @@ def get_full_data_from_table_dfs(comp_df):
         full_data_dict[key] = {}
         if key == 'ratios':
             for category in table_categories_list:
-                full_data_dict[key][category] = comp_df[key][comp_df[key]['Year Ending'] == category]['Current'].values[0]
+                full_data_dict[key][category] = comp_df[key][comp_df[key]['Fiscal Year'] == category]['Current'].values[0]
         else:
             for category in table_categories_list:
-                full_data_dict[key][category] = comp_df[key][comp_df[key]['Year Ending'] == category]['TTM'].values[0]
+                full_data_dict[key][category] = comp_df[key][comp_df[key]['Fiscal Year'] == category]['TTM'].values[0]
 
     return full_data_dict
 
@@ -111,8 +131,11 @@ ticker_list = list(ipos_df['Symbol'].values)
 
 
 dov_financials_df = get_company_financials_as_df(ticker='dov')
-dov_financials_df['ratios'][dov_financials_df['ratios']['Year Ending'] == 'Debt / Equity Ratio']['Current'].values[0]
+dov_financials_df['ratios'][dov_financials_df['ratios']['Fiscal Year'] == 'Debt / Equity Ratio']['Current'].values[0]
 
 full_data_dict = get_full_data_from_table_dfs(dov_financials_df)
 
 
+# Changes:
+# added another row of categories (right under the first)
+# changes 'Year Ending' to 'Fiscal Year'
