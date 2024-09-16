@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 # pip install lxml
 
+### This file only pulls a list from wikipedia
+
 # https://stackoverflow.com/questions/44232578/get-the-sp-500-tickers-list
 def list_wikipedia_sp500() -> pd.DataFrame:
     # Ref: https://stackoverflow.com/a/75845569/

@@ -4,7 +4,7 @@ import pandas as pd
 
 
 ###  The code gets a url that includes a table of companies a the table as a dataframe
-### I can also gets the full financial data from Stockanalysis
+### I can also get the full financial data from Stockanalysis
 
 
 # https://stockanalysis.com/list/

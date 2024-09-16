@@ -4,11 +4,12 @@ import numpy as np
 from investing.gf_analyze_ticker import get_financial_data_for_ticker
 
 
-### The code gets a ticker_list and a dataframe (with Symbol and Company) and returns the best companies (according to Gurufocus data)
+### The code gets a ticker_list and a dataframe (with Symbol and Company)
+### and returns the best companies (according to Gurufocus data) according to predefined rules
 
 # code for get_companies_from_wiki was here first
 
-###### Make a dataframe of all best companies
+## Make a dataframe of all best companies
 
 # Define a function to extract and handle the score
 def extract_scores(main_scores, key):
