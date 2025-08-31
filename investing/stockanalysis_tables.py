@@ -108,26 +108,50 @@ def get_company_financials_as_df(ticker):
     return df
 
 
-def get_full_data_from_table_dfs(comp_df):
-    # retunrs data from table dataframes is a fully dictionary (then you can accesss anything using this dictionary)
+def _find_label_col(df):
+    # common possibilities seen on StockAnalysis tables
+    candidates = ['Fiscal Year', 'Year Ending', 'Period Ending', 'Metric', 'Breakdown', 'Category', 'Item']
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # as a fallback, assume the leftmost column is the label column
+    return df.columns[0]
 
+def get_full_data_from_table_dfs(comp_df):
+    """
+    Returns a nested dict:
+      full_data_dict[table_key][row_label] = value_from_desired_column
+    For ratios -> 'Current'
+    For others -> 'TTM'
+    """
     full_data_dict = {}
-    for key in comp_df.keys():
-        table_categories_list = list(comp_df[key]['Year Ending'].values) # categories appearing in each table
+    for key, df in comp_df.items():
+        if df is None or df.empty:
+            full_data_dict[key] = {}
+            continue
+
+        label_col = _find_label_col(df)
+
+        # choose the value column depending on table type
+        value_col = 'Current' if key == 'ratios' else 'TTM'
+        if value_col not in df.columns:
+            # if TTM/Current missing, pick the last numeric-ish column as a fallback
+            numeric_like = [c for c in df.columns if c != label_col]
+            value_col = numeric_like[-1] if numeric_like else df.columns[-1]
 
         full_data_dict[key] = {}
-        if key == 'ratios':
-            for category in table_categories_list:
-                full_data_dict[key][category] = comp_df[key][comp_df[key]['Fiscal Year'] == category]['Current'].values[0]
-        else:
-            for category in table_categories_list:
-                full_data_dict[key][category] = comp_df[key][comp_df[key]['Fiscal Year'] == category]['TTM'].values[0]
+        for category in df[label_col].dropna().tolist():
+            row = df[df[label_col] == category]
+            if not row.empty and value_col in row.columns:
+                full_data_dict[key][category] = row.iloc[0][value_col]
+            else:
+                full_data_dict[key][category] = None
 
     return full_data_dict
 
-# sp500_df = get_data_table(sp500_url)
-ipos_df = get_data_table(ipos_url)
-ticker_list = list(ipos_df['Symbol'].values)
+sp500_df = get_data_table(sp500_url)
+# ipos_df = get_data_table(ipos_url)
+ticker_list = list(sp500_df['Symbol'].values)
 
 
 dov_financials_df = get_company_financials_as_df(ticker='dov')
