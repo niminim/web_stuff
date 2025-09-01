@@ -108,43 +108,75 @@ def get_company_financials_as_df(ticker):
     return df
 
 
-def _find_label_col(df):
-    # common possibilities seen on StockAnalysis tables
-    candidates = ['Fiscal Year', 'Year Ending', 'Period Ending', 'Metric', 'Breakdown', 'Category', 'Item']
-    for c in candidates:
-        if c in df.columns:
-            return c
-    # as a fallback, assume the leftmost column is the label column
-    return df.columns[0]
-
 def get_full_data_from_table_dfs(comp_df):
     """
-    Returns a nested dict:
-      full_data_dict[table_key][row_label] = value_from_desired_column
-    For ratios -> 'Current'
-    For others -> 'TTM'
+    Build a nested dictionary from the financials DataFrames of a company.
+
+    Output structure:
+        full_data_dict[table_key][row_label] = value
+
+    - For 'ratios' tables, values come from the 'Current' column.
+    - For other tables (income, balance sheet, cash flow), values come from 'TTM'.
+    - If the expected column doesn't exist, fallback logic is applied.
+
+    Example:
+        full_data_dict['ratios']['Debt / Equity Ratio'] -> "value"
     """
+
+    def _find_label_col(df):
+        """
+        Try to detect which column holds the row labels (e.g., 'Fiscal Year', 'Metric').
+        StockAnalysis uses different names depending on the table type.
+
+        Returns:
+            Name of the label column.
+        """
+        candidates = [
+            'Fiscal Year', 'Year Ending', 'Period Ending',
+            'Metric', 'Breakdown', 'Category', 'Item'
+        ]
+        for c in candidates:
+            if c in df.columns:
+                return c
+        # If none of the candidates are found, fallback to the first column
+        return df.columns[0]
+
+    # Main dictionary to store all tables for the company
     full_data_dict = {}
+
+    # Iterate over each financial table: income, balance_sheet, cash_flow, ratios
     for key, df in comp_df.items():
+        # Handle missing or empty DataFrames
         if df is None or df.empty:
             full_data_dict[key] = {}
             continue
 
+        # Detect the column that contains row labels (categories, fiscal years, metrics, etc.)
         label_col = _find_label_col(df)
 
-        # choose the value column depending on table type
+        # Decide which column to use for numeric values
+        # - Ratios tables → 'Current'
+        # - Others        → 'TTM'
         value_col = 'Current' if key == 'ratios' else 'TTM'
+
+        # If the expected column is not found, pick the last non-label column as a fallback
         if value_col not in df.columns:
-            # if TTM/Current missing, pick the last numeric-ish column as a fallback
             numeric_like = [c for c in df.columns if c != label_col]
             value_col = numeric_like[-1] if numeric_like else df.columns[-1]
 
+        # Initialize dictionary for this specific table
         full_data_dict[key] = {}
+
+        # Loop through each row label (e.g., "Debt / Equity Ratio", "2023", "Net Income")
         for category in df[label_col].dropna().tolist():
+            # Extract the row corresponding to this category
             row = df[df[label_col] == category]
+
+            # If the row exists and the value column is present, extract the value
             if not row.empty and value_col in row.columns:
                 full_data_dict[key][category] = row.iloc[0][value_col]
             else:
+                # If something is missing, store None to avoid KeyErrors later
                 full_data_dict[key][category] = None
 
     return full_data_dict
