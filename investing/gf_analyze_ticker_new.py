@@ -1,21 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-GuruFocus summary scraper with requests -> Playwright fallback.
+GuruFocus summary scraper — high-efficiency version + single-ticker wrapper.
 
-What this script does
----------------------
-1) Fetches a ticker's GuruFocus "summary" page (requests first; optional Playwright fallback).
-2) Parses the 5 main rank bars (0–10) + GF Score (0–100) and the "other indicators" table.
-3) Converts results into a one-row DataFrame per ticker and appends to CSV.
-4) Writes a per-ticker JSON file of the 5 ranks with **bolded** keys for nicer display in Markdown viewers.
+Features
+--------
+- Requests-first pipeline with Playwright fallback (reused browser).
+- Extracts 5 ranks + GF Score + "other indicators" table.
+- Prints all parsed data to console (not just counts).
+- Saves per-ticker JSON (main ranks) and a combined CSV of all tickers.
 
-Notes & Caveats
----------------
-- Scraping may be restricted by the site's ToS. Prefer official APIs if available.
-- DOM/classes may change; logic is best-effort.
-- Playwright requires:
-    pip install playwright
-    python -m playwright install
+Setup
+-----
+pip install playwright
+python -m playwright install
 """
 
 from __future__ import annotations
@@ -27,10 +24,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from random import uniform
 from typing import Dict, Tuple, Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+    HAVE_BS4 = True
+except Exception:
+    HAVE_BS4 = False
+
 
 # =========================
 # Configuration / Globals
@@ -38,7 +42,6 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.gurufocus.com/stock/{ticker}/summary"
 
-# Browser-like headers to reduce the chance of bot blocking
 BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -50,105 +53,58 @@ BASE_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.gurufocus.com/",
 }
 
-# A single session improves reuse of HTTP connection + headers
 SESSION = requests.Session()
 SESSION.headers.update(BASE_HEADERS)
-# `requests` timeout (seconds) for connect + read (tuple) or a single number
-SESSION.timeout = 20  # type: ignore[attr-defined]  # (kept for readability; requests.Session doesn't use it directly)
+SESSION.timeout = 20  # type: ignore[attr-defined]
+
+BS_PARSER = "lxml" if HAVE_BS4 else "html.parser"
+DEBUG_ARTIFACTS = False
 
 
 # =========================
-# Small utilities
+# Utilities
 # =========================
 
-def _sleep_jitter(low: float = 0.35, high: float = 1.0) -> None:
-    """Sleep a small random time to look less bot-like."""
+def _sleep_jitter(low: float = 0.15, high: float = 0.45) -> None:
     time.sleep(uniform(low, high))
 
 
-def _soup(html: str) -> BeautifulSoup:
-    """Create a BeautifulSoup object with a forgiving parser."""
-    # If you have lxml installed, you can switch to 'lxml' for speed:
-    # return BeautifulSoup(html, 'lxml')
-    return BeautifulSoup(html, "html.parser")
+def _soup(html: str):
+    if not HAVE_BS4:
+        raise RuntimeError("BeautifulSoup (bs4) is required.")
+    return BeautifulSoup(html, BS_PARSER)
 
 
 # =========================
-# Network fetchers
+# Fetchers
 # =========================
 
 def fetch_html_requests(url: str, max_retries: int = 3, timeout: float = 20.0) -> Tuple[Optional[str], Optional[int]]:
-    """
-    Try fetching HTML via `requests`.
-    Returns: (html_text or None, status_code or None)
-    """
     last_status: Optional[int] = None
     for attempt in range(1, max_retries + 1):
         try:
             _sleep_jitter()
             resp = SESSION.get(url, allow_redirects=True, timeout=timeout)
             last_status = resp.status_code
-
             if resp.status_code == 200 and resp.text:
                 return resp.text, resp.status_code
-
-            # Mild backoff on common "come back later" statuses
             if resp.status_code in (403, 429, 503):
-                time.sleep(1.2 * attempt)
+                time.sleep(0.6 * attempt)
             else:
                 break
         except requests.RequestException:
-            time.sleep(1.0 * attempt)
+            time.sleep(0.6 * attempt)
     return None, last_status
 
 
-def fetch_html_playwright(url: str, headless: bool = True, wait_selector: Optional[str] = None, wait_ms: int = 1500) -> str:
-    """
-    Fetch rendered HTML with Playwright/Chromium (executes JS).
-    Only import Playwright if requested to keep lightweight by default.
-    """
-    from playwright.sync_api import sync_playwright  # local import to avoid hard dependency
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            user_agent=BASE_HEADERS["User-Agent"],
-            viewport={"width": 1366, "height": 768},
-            java_script_enabled=True,
-        )
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded")
-
-        # Allow time for async widgets to render
-        page.wait_for_timeout(wait_ms)
-
-        # Optionally wait for a stable anchor element (best-effort)
-        if wait_selector:
-            try:
-                page.wait_for_selector(wait_selector, timeout=5000)
-            except Exception:
-                pass
-
-        html = page.content()
-        context.close()
-        browser.close()
-        return html
-
-
 # =========================
-# Parsers (ranks, GF score, indicators)
+# Parsers
 # =========================
 
-def extract_rank_score(soup: BeautifulSoup, rank_name: str, identifier: str) -> str:
-    """
-    Extract a 0–10 rank score.
-    Logic:
-      1) Find an <a> tag whose href contains `identifier`
-      2) Find the next div.indicator-progress-bar-header
-      3) Read the inner <div style="width: NN%;"> → score ≈ int(NN / 10)
-    """
+def extract_rank_score(soup, rank_name: str, identifier: str) -> str:
     anchor = soup.find("a", href=lambda href: href and identifier in href)
     if anchor:
         score_div = anchor.find_next("div", class_="indicator-progress-bar-header")
@@ -164,27 +120,27 @@ def extract_rank_score(soup: BeautifulSoup, rank_name: str, identifier: str) -> 
     return f"{rank_name} score not found."
 
 
-def extract_gf_score(html_text: str) -> str:
-    """
-    Extract GF Score (0–100) from inline JS like: gf_score: 69
-    Returns 'NN/100' or a not-found message.
-    """
+def extract_gf_score_from_html(html_text: str) -> Optional[int]:
     if not html_text:
-        return "GF Score not found."
-    m = re.search(r"gf_score\s*:\s*(\d+)", html_text)
-    if m:
-        try:
-            return f"{int(m.group(1))}/100"
-        except ValueError:
-            pass
-    return "GF Score not found."
+        return None
+    for pat in (
+        r"gf_score\s*:\s*(\d+)",
+        r'"gf_score"\s*:\s*(\d+)',
+        r'"gfScore"\s*:\s*(\d+)',
+        r"data-gf-score\s*=\s*\"?(\d+)\"?",
+    ):
+        m = re.search(pat, html_text, flags=re.I)
+        if m:
+            try:
+                val = int(m.group(1))
+                if 0 <= val <= 100:
+                    return val
+            except ValueError:
+                pass
+    return None
 
 
-def extract_financial_data(soup: BeautifulSoup) -> Dict[str, str]:
-    """
-    Parse the "other indicators" table (best-effort).
-    Returns a dict: {metric_name: value_text}
-    """
+def extract_financial_data(soup) -> Dict[str, str]:
     data: Dict[str, str] = {}
     rows = soup.find_all("tr", class_="stock-indicators-table-row")
     for row in rows:
@@ -203,64 +159,32 @@ def extract_financial_data(soup: BeautifulSoup) -> Dict[str, str]:
 # =========================
 
 def _to_number(x) -> Optional[float] | str:
-    """
-    Convert numeric-like strings to float when possible.
-    - '71.5%' → 71.5
-    - '5/9'   → keep as '5/9' (rank fraction)
-    - 'N/A', 'No Debt', '' → None
-    """
     if x is None:
         return None
     s = str(x).strip()
     if not s or s.lower() in {"no", "none", "n/a", "na", "no debt"}:
         return None
-    # Keep exact rank fractions (e.g., '5/9') as-is
     if re.match(r"^\d+\s*/\s*\d+$", s):
         return s
-    # Remove thousands separators and '%' to parse numerics
     s_clean = s.replace(",", "").rstrip("%")
     try:
         return float(s_clean)
     except ValueError:
-        return x  # leave original string
+        return x
 
 
 def dicts_to_df(ticker: str, main_scores: Dict[str, str], other_data: Dict[str, str]) -> pd.DataFrame:
-    """
-    Build a single-row DataFrame for a ticker.
-      - 'score_*' columns keep string form (e.g., '8/10', '68/100')
-      - 'metric_*' columns attempt numeric conversion
-      - Adds 'ticker' and 'scraped_at'
-    """
     row = {
         "ticker": ticker.upper(),
         "scraped_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
-    # Main (string) scores
     row.update({f"score_{k}": v for k, v in main_scores.items()})
-    # Other indicators (numeric where possible)
     for k, v in other_data.items():
         row[f"metric_{k}"] = _to_number(v)
     return pd.DataFrame([row])
 
 
-def append_csv(path: str, df: pd.DataFrame) -> None:
-    """
-    Append df to CSV (create if missing). Keeps all columns.
-    """
-    try:
-        existing = pd.read_csv(path)
-        out = pd.concat([existing, df], ignore_index=True)
-    except FileNotFoundError:
-        out = df
-    out.to_csv(path, index=False)
-
-
 def save_scores_json(path: str, ticker: str, main_scores: Dict[str, str]) -> None:
-    """
-    Save the 5 main rank scores to a JSON file with **bolded** keys
-    (nice in Markdown-aware viewers).
-    """
     data = {
         "**Financial Strength**": main_scores.get("financial_str"),
         "**Profitability Rank**": main_scores.get("profit"),
@@ -273,112 +197,280 @@ def save_scores_json(path: str, ticker: str, main_scores: Dict[str, str]) -> Non
 
 
 # =========================
+# Playwright client
+# =========================
+
+class PlaywrightClient:
+    def __init__(self, headless: bool = True):
+        from playwright.sync_api import sync_playwright
+        self._p = sync_playwright().start()
+        self._browser = self._p.chromium.launch(headless=headless)
+        self._context = self._browser.new_context(
+            user_agent=BASE_HEADERS["User-Agent"],
+            viewport={"width": 1366, "height": 768},
+            java_script_enabled=True,
+        )
+
+    def close(self):
+        try:
+            self._context.close()
+        finally:
+            try:
+                self._browser.close()
+            finally:
+                self._p.stop()
+
+    @staticmethod
+    def _extract_from_blob(blob: str) -> Optional[int]:
+        if not blob:
+            return None
+        m = re.search(r'"gf_score"\s*:\s*(\d+)', blob, flags=re.I)
+        if not m:
+            m = re.search(r'"gfScore"\s*:\s*(\d+)', blob, flags=re.I)
+        if m:
+            try:
+                x = int(m.group(1))
+                if 0 <= x <= 100:
+                    return x
+            except ValueError:
+                pass
+        return None
+
+    def fetch(self, url: str, wait_selector: Optional[str] = None, wait_ms: int = 1200,
+              debug_name: Optional[str] = None) -> Tuple[str, Optional[int]]:
+        page = self._context.new_page()
+        gf_holder = {"val": None}
+
+        def on_response(resp):
+            if gf_holder["val"] is not None:
+                return
+            try:
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "application/json" in ctype or "text/plain" in ctype or "application/javascript" in ctype:
+                    body = resp.text()
+                    if body and len(body) <= 2_000_000:
+                        v = self._extract_from_blob(body)
+                        if v is not None:
+                            gf_holder["val"] = v
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_timeout(wait_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        if wait_selector:
+            try:
+                page.wait_for_selector(wait_selector, timeout=4000)
+            except Exception:
+                pass
+
+        # Inspect window app state
+        if gf_holder["val"] is None:
+            try:
+                bag = page.evaluate("""
+                () => {
+                  function safe(v){try{return JSON.stringify(v)}catch(e){return null}}
+                  const out = {};
+                  try { if (window.__NUXT__) out.__NUXT__ = safe(window.__NUXT__); } catch(e){}
+                  try { if (window.__NEXT_DATA__) out.__NEXT_DATA__ = safe(window.__NEXT_DATA__); } catch(e){}
+                  try { if (window.__APOLLO_STATE__) out.__APOLLO_STATE__ = safe(window.__APOLLO_STATE__); } catch(e){}
+                  try { if (window.__INITIAL_STATE__) out.__INITIAL_STATE__ = safe(window.__INITIAL_STATE__); } catch(e){}
+                  try { if (window.__DATA__) out.__DATA__ = safe(window.__DATA__); } catch(e){}
+                  try { if (window.__STATE__) out.__STATE__ = safe(window.__STATE__); } catch(e){}
+                  return out;
+                }
+                """)
+            except Exception:
+                bag = {}
+            blob = "".join(v for v in (bag or {}).values() if isinstance(v, str))
+            if blob:
+                v2 = self._extract_from_blob(blob)
+                if v2 is not None:
+                    gf_holder["val"] = v2
+
+        html = page.content()
+        if gf_holder["val"] is None:
+            v3 = extract_gf_score_from_html(html)
+            if v3 is not None:
+                gf_holder["val"] = v3
+
+        page.close()
+        return html, gf_holder["val"]
+
+
+# =========================
 # Orchestrator
+# =========================
+
+@dataclass
+class TickerResult:
+    ticker: str
+    main_scores: Dict[str, str]
+    other_data: Dict[str, str]
+
+
+def _parse_all_from_html(ticker: str, html: str, gf_hint: Optional[int] = None) -> TickerResult:
+    s = _soup(html)
+    main = {
+        "financial_str": extract_rank_score(s, "Financial Strength", "rank-balancesheet"),
+        "profit":        extract_rank_score(s, "Profitability Rank", "rank-profitability"),
+        "growth":        extract_rank_score(s, "Growth Rank", "rank-growth"),
+        "gf_value":      extract_rank_score(s, "GF Value Rank", "rank-gf-value"),
+        "momentum":      extract_rank_score(s, "Momentum Rank", "rank-momentum"),
+        "GF_score":      "GF Score not found.",
+    }
+    if gf_hint is not None:
+        main["GF_score"] = f"{gf_hint}/100"
+    else:
+        gf_try = extract_gf_score_from_html(html)
+        if gf_try is not None:
+            main["GF_score"] = f"{gf_try}/100"
+    other = extract_financial_data(s)
+    return TickerResult(ticker=ticker, main_scores=main, other_data=other)
+
+
+def _core_missing(main_scores: Dict[str, str]) -> bool:
+    if not main_scores:
+        return True
+    not_found = {
+        "GF Score not found.",
+        "Financial Strength score not found.",
+        "Profitability Rank score not found.",
+        "Growth Rank score not found.",
+        "GF Value Rank score not found.",
+        "Momentum Rank score not found.",
+    }
+    gf_missing = (main_scores.get("GF_score") in not_found)
+    ranks = [main_scores.get(k, "") for k in ("financial_str", "profit", "growth", "gf_value", "momentum")]
+    ranks_missing = not any(re.match(r"^\d+\s*/\s*10$", r or "") for r in ranks)
+    return gf_missing or ranks_missing
+
+
+def scrape_tickers(tickers: List[str],
+                   max_workers: int = 8,
+                   headless: bool = True,
+                   wait_selector: Optional[str] = None) -> List[TickerResult]:
+    tickers = [t.upper() for t in tickers]
+    results: Dict[str, TickerResult] = {}
+    need_fallback: List[str] = []
+
+    def _worker(tk: str) -> Tuple[str, Optional[TickerResult]]:
+        url = BASE_URL.format(ticker=tk)
+        html, status = fetch_html_requests(url)
+        if not html or status != 200:
+            return tk, None
+        try:
+            res = _parse_all_from_html(tk, html)
+            return tk, res
+        except Exception:
+            return tk, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_worker, t): t for t in tickers}
+        for fut in as_completed(futures):
+            tkr = futures[fut]
+            res = fut.result()[1]
+            if res is None or _core_missing(res.main_scores):
+                need_fallback.append(tkr)
+            else:
+                results[tkr] = res
+
+    if need_fallback:
+        pw = PlaywrightClient(headless=headless)
+        try:
+            for tk in need_fallback:
+                url = BASE_URL.format(ticker=tk)
+                html2, gf_val = pw.fetch(url, wait_selector=wait_selector, wait_ms=1200)
+                res2 = _parse_all_from_html(tk, html2, gf_hint=gf_val)
+                results[tk] = res2
+        finally:
+            pw.close()
+
+    return [results[t] for t in tickers]
+
+
+# =========================
+# Wrapper for compatibility
 # =========================
 
 def get_financial_data_for_ticker(
     ticker: str,
-    print_all_data: bool = False,
     headless: bool = True,
-    use_playwright_fallback: bool = True,
-    wait_selector: Optional[str] = None,
-) -> Tuple[Dict[str, str], Dict[str, str]]:
+    print_all_data: bool = True
+) -> tuple[dict, dict]:
     """
-    Orchestrate fetching and parsing for a single ticker.
+    Scrape a single ticker and (optionally) print results.
+
+    Args:
+        ticker: Stock ticker (str).
+        headless: Playwright headless mode.
+        print_all_data: If True, print main_scores and other_data;
+                        If False, print only main_scores.
+
     Returns:
-      (main_scores, all_other_data)
+        (main_scores, other_data)
     """
-    url = BASE_URL.format(ticker=ticker)
+    results = scrape_tickers([ticker], max_workers=1, headless=headless)
+    r = results[0]
 
-    # 1) Try fast path: requests
-    html, status = fetch_html_requests(url)
-    if not html or status != 200:
-        # 2) Fallback: Playwright (rendered HTML)
-        if use_playwright_fallback:
-            try:
-                html = fetch_html_playwright(url, headless=headless, wait_selector=wait_selector)
-            except Exception as e:
-                print(f"[{ticker}] Playwright failed: {e}")
-                return {}, {}
-        else:
-            return {}, {}
-
-    soup = _soup(html)
-
-    # Extract the 5 main rank scores + GF Score
-    main_scores = {
-        "financial_str": extract_rank_score(soup, "Financial Strength", "rank-balancesheet"),
-        "profit":        extract_rank_score(soup, "Profitability Rank", "rank-profitability"),
-        "growth":        extract_rank_score(soup, "Growth Rank", "rank-growth"),
-        "gf_value":      extract_rank_score(soup, "GF Value Rank", "rank-gf-value"),
-        "momentum":      extract_rank_score(soup, "Momentum Rank", "rank-momentum"),
-        "GF_score":      extract_gf_score(html),
-    }
-
-    # Parse the "other indicators" table
-    all_data = extract_financial_data(soup)
-
-    # Console log (optional)
-    print(f"\n=== {ticker.upper()} | Main Scores ===")
-    for k, v in main_scores.items():
-        print(f"{k:15s}: {v}")
-
+    # --- Printing is centralized here only ---
     if print_all_data:
-        print("\n=== Other Financial Data ===")
-        if all_data:
-            for k, v in all_data.items():
-                print(f"{k}: {v}")
-        else:
-            print("No additional financial data found.")
+        print(f"\n=== {r.ticker} | Main Scores ===")
+        for k, v in r.main_scores.items():
+            print(f"{k:15s}: {v}")
 
-    return main_scores, all_data
+        if r.other_data:
+            print("\n--- Other Indicators ---")
+            for k, v in r.other_data.items():
+                print(f"{k:40s}: {v}")
+        else:
+            print("\n(No additional indicators found)")
+    else:
+        print(f"\n=== {r.ticker} | Main Scores ===")
+        for k, v in r.main_scores.items():
+            print(f"{k:15s}: {v}")
+    # ----------------------------------------
+
+    return r.main_scores, r.other_data
 
 
 # =========================
-# CLI-style usage
+# CLI
 # =========================
 
 if __name__ == "__main__":
-    # --- Set your tickers here ---
     tickers: List[str] = ["SMR", "NVDA"]
-
-    # Where to append structured results
     out_csv = "/home/nim/Downloads/gurufocus_scrapes.csv"
 
-    # Collect each 1-row DF so we can preview a combined view at the end
+    # Scrape tickers (no per-ticker prints here)
+    out: List[TickerResult] = scrape_tickers(tickers, max_workers=8, headless=True)
+
+    # Build DataFrame and save artifacts quietly
     all_rows: List[pd.DataFrame] = []
-
-    for t in tickers:
-        main_scores, other = get_financial_data_for_ticker(
-            t,
-            print_all_data=True,       # print parsed "other indicators" to console
-            headless=True,             # set False to watch the browser if Playwright is used
-            use_playwright_fallback=True,
-            wait_selector=None,        # optionally wait for a stable element
-        )
-
-        # Turn results into a single-row DataFrame and append to CSV
-        df_row = dicts_to_df(t, main_scores, other)
-        append_csv(out_csv, df_row)
+    for item in out:
+        # no printing here
+        df_row = dicts_to_df(item.ticker, item.main_scores, item.other_data)
         all_rows.append(df_row)
+        save_scores_json(f"{item.ticker}_scores.json", item.ticker, item.main_scores)
 
-        # Save a per-ticker JSON summarizing the 5 key ranks (bold keys)
-        save_scores_json(f"{t}_scores.json", t, main_scores)
-
-        print(f"\nSaved {t.upper()} data to {out_csv} and {t}_scores.json\n" + "-" * 50)
-
-    # ---------- Console preview (cleaned) ----------
+    # ✅ Keep the combined preview print
     if all_rows:
-        combined_df = pd.concat(all_rows, ignore_index=True)
+        combined = pd.concat(all_rows, ignore_index=True)
+        # Save CSV (keeps your gurufocus_scrapes file updated)
+        combined.to_csv(out_csv, index=False)
 
-        # Create a preview copy:
-        #   - drop 'scraped_at'
-        #   - rename score_* columns by removing 'score_' prefix
-        preview_df = combined_df.copy()
+        preview_df = combined.copy()
         preview_df = preview_df.drop(columns=["scraped_at"], errors="ignore")
         preview_df = preview_df.rename(
             columns={c: c.replace("score_", "") for c in preview_df.columns if c.startswith("score_")}
         )
-
         print("\nCombined DataFrame preview (first 7 columns, cleaned):")
         print(preview_df.iloc[:, :7].head())
+
+    print(f"\nSaved data for {len(all_rows)} tickers to {out_csv}")

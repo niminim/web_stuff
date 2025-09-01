@@ -21,7 +21,7 @@ for i, row in enumerate(df.iterrows()):
 mmm_row = df.loc['MMM']
 ticker_list = list(df.index)
 
-df.to_csv("/home/nim/output_1.csv", index=True) # for option 1
+df.to_csv("/home/nim/Downloads/companies.csv", index=True) # for option 1
 #######
 
 
