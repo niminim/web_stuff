@@ -125,3 +125,4 @@ ticker = 'MTSFY'  # You can change this ticker symbol to fetch data for another 
 ticker = 'SMR'
 main_indicators, all_data = get_financial_data_for_ticker(ticker, print_all_data=True)
 
+
