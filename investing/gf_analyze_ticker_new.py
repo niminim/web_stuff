@@ -446,6 +446,8 @@ def get_financial_data_for_ticker(
 
 if __name__ == "__main__":
     tickers: List[str] = ["SMR", "NVDA"]
+    tickers: List[str] = ["TTI", "NVDA"]
+
     out_csv = "/home/nim/Downloads/gurufocus_scrapes.csv"
 
     # Scrape tickers (no per-ticker prints here)

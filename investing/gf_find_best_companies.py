@@ -179,7 +179,7 @@ def get_best_companies(ticker_list: List[str], df: Optional[pd.DataFrame] = None
 # Example usage
 # --------------------------------------------------------------------------------------
 tickers_list = ['NVDA', 'MSFT', 'SMR', 'AAPL', 'DOV']
-df_best_companies = get_best_companies(tickers_list)
+df_best_companies = get_best_companies(tickers_list) # optional (tickers_list, ipos_df)
 
 # # Optional: preview (hide scraped_at or score_ etc. if you add those later)
 # print(df_best_companies.head())

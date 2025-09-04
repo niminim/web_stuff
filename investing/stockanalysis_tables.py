@@ -182,8 +182,8 @@ def get_full_data_from_table_dfs(comp_df):
     return full_data_dict
 
 sp500_df = get_data_table(sp500_url)
-# ipos_df = get_data_table(ipos_url)
-ticker_list = list(sp500_df['Symbol'].values)
+ipos_df = get_data_table(ipos_url)
+ticker_list = list(ipos_df['Symbol'].values)
 
 
 dov_financials_df = get_company_financials_as_df(ticker='dov')
@@ -195,3 +195,4 @@ full_data_dict = get_full_data_from_table_dfs(dov_financials_df)
 # Changes:
 # added another row of categories (right under the first)
 # changes 'Year Ending' to 'Fiscal Year'
+
