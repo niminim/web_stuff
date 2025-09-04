@@ -1,20 +1,20 @@
-### 2) News APIs (Bing News / NewsAPI / GNews / etc.)
 """
 GNews fetcher (company-agnostic) — token auth, retries, pagination, de-dup
 ----------------------------------------------------------------------------
 
 Quick start:
-  1) Paste your GNews token into GNEWS_TOKEN below.
-  2) Run this file directly:  python gnews_fetch.py
+  1) Pass your GNews token via token=... (e.g., from env vars).
+  2) Run this file directly:  python news_api_GNews.py
   3) Start small (max_results=10, per_page=10) if you're on a free tier.
 
 What this module does:
-  • Builds a Boolean query for any company (with optional tickers/synonyms)
+  • Builds a Boolean query for any company (with optional tickers/synonyms/extra_terms)
   • Calls GNews /search with a UTC date window (from/to)
   • Uses a persistent requests.Session with retry + connection pooling
   • Paginates until max_results are collected (or results end)
   • Canonicalizes URLs (removes tracking params) and de-dupes
   • Normalizes each item: {title, url, published, source}
+  • On HTTP 429 (rate limit), returns partial results with rate_limited=True
 
 Why these design choices:
   • Server-side filtering (q/from/to/lang) reduces local post-processing
@@ -30,42 +30,26 @@ from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime, timedelta, timezone
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 1) YOUR GNEWS TOKEN (INLINE FOR SIMPLICITY)
-#    ⚠ For production, prefer environment variables or a secrets manager
-#       (e.g., os.environ['GNEWS_TOKEN'], AWS/GCP secret stores, etc.).
-# ───────────────────────────────────────────────────────────────────────────────
-GNEWS_TOKEN = "PASTE_YOUR_REAL_TOKEN_HERE"   # ← replace with your token
-
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 2) SMALL, REUSABLE HELPERS
+# Small, reusable helpers
 # ───────────────────────────────────────────────────────────────────────────────
 
 def canonical_url(url: str) -> str:
-    """
-    Remove common tracking parameters so the *same* article URL from different
-    sources (or with UTM tags) collapses to a single canonical form.
-    This improves de-duplication and prevents double-counting.
-    """
+    """Remove tracking params to improve de-duplication."""
     if not url:
         return url
     u = urlparse(url)
-    # Common analytics / campaign params that don't change the content
     drop = {
         "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_name",
         "gclid", "gbraid", "wbraid", "fbclid", "mc_cid", "mc_eid"
     }
-    # Rebuild the query string while skipping tracking params (case-insensitive)
     qs = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k.lower() not in drop]
     return urlunparse(u._replace(query=urlencode(qs)))
 
 
 def iso8601_utc(dt: datetime) -> str:
-    """
-    Convert naive/aware datetimes to strict Zulu ISO8601 (e.g., 2025-09-04T10:20:00Z).
-    GNews accepts ISO8601; using Z avoids timezone ambiguity.
-    """
+    """Convert datetime to strict ISO8601 Zulu string (UTC)."""
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -75,18 +59,7 @@ def build_company_query(
     synonyms: Optional[List[str]] = None,
     extra_terms: Optional[List[str]] = None,
 ) -> str:
-    """
-    Build a robust Boolean query for GNews search.
-
-    Rules:
-      • Company & synonyms are quoted for exact phrase matching
-      • Tickers are left unquoted (short tokens—better match rate)
-      • extra_terms (quoted) are optional relevance tightenings (“earnings”, “GPU”)
-
-    Example:
-      company="NVIDIA", tickers=["NVDA"], synonyms=["NVIDIA Corporation"]
-      -> '"NVIDIA" OR "NVIDIA Corporation" OR NVDA'
-    """
+    """Build a robust Boolean query for GNews search."""
     tickers = tickers or []
     synonyms = synonyms or []
     extra_terms = extra_terms or []
@@ -95,10 +68,9 @@ def build_company_query(
     if company and company.strip():
         parts.append(f'"{company.strip()}"')
     parts += [f'"{s.strip()}"' for s in synonyms if s and s.strip()]
-    parts += [t.strip() for t in tickers if t and t.strip()]           # keep tickers unquoted
+    parts += [t.strip() for t in tickers if t and t.strip()]           # unquoted tickers
     parts += [f'"{t.strip()}"' for t in extra_terms if t and t.strip()]
 
-    # De-duplicate while preserving order to avoid bloated queries:
     seen, deduped = set(), []
     for p in parts:
         if p not in seen:
@@ -108,18 +80,11 @@ def build_company_query(
 
 
 def make_session(total_retries: int = 2, backoff: float = 0.3) -> requests.Session:
-    """
-    Create a persistent HTTP session with:
-      • Connection pooling (faster than new connection per request)
-      • Modest retries on transient errors (429/5xx) with exponential backoff
-
-    Keep retries conservative to respect rate limits and provider TOS.
-    """
+    """Persistent session with connection pooling + modest retries."""
     from requests.adapters import HTTPAdapter
     try:
         from urllib3.util.retry import Retry
     except Exception:
-        # For older vendored urllib3 in some requests builds
         from requests.packages.urllib3.util.retry import Retry  # type: ignore
 
     retry = Retry(
@@ -127,20 +92,20 @@ def make_session(total_retries: int = 2, backoff: float = 0.3) -> requests.Sessi
         read=total_retries,
         connect=total_retries,
         backoff_factor=backoff,
-        status_forcelist=(429, 500, 502, 503, 504),  # typical transient conditions
+        status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,  # don't raise inside urllib3; we handle after .get()
+        raise_on_status=False,
     )
     sess = requests.Session()
     adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=32)
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
-    sess.headers.update({"User-Agent": "gnews-fetcher/1.2"})  # friendly UA
+    sess.headers.update({"User-Agent": "gnews-fetcher/1.3"})
     return sess
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 3) MAIN FETCHER
+# Main fetcher
 # ───────────────────────────────────────────────────────────────────────────────
 
 def fetch_gnews(
@@ -148,92 +113,80 @@ def fetch_gnews(
     *,
     tickers: Optional[List[str]] = None,
     synonyms: Optional[List[str]] = None,
+    extra_terms: Optional[List[str]] = None,   # parity with other fetchers
     lang: str = "en",
     country: str = "us",
     days_back: int = 2,
-    max_results: int = 40,        # 👍 safe overall cap; adjust to your plan
-    per_page: int = 10,           # 👍 free tiers often allow up to 10 per call
-    search_in: str = "title,description",  # add ",content" on paid plans if needed
-    sortby: str = "publishedAt",  # or "relevance"
-    expand_content: bool = False, # paid feature for full content
+    max_results: int = 20,
+    per_page: int = 10,
+    search_in: str = "title,description",
+    sortby: str = "publishedAt",
+    expand_content: bool = False,
     session: Optional[requests.Session] = None,
     dedupe: bool = True,
-    inter_page_sleep: float = 0.15,  # polite pause between pages
-    timeout: int = 20,               # network timeout per request (seconds)
-    token: Optional[str] = None,     # override inline token if desired
+    inter_page_sleep: float = 0.15,
+    timeout: int = 20,
+    token: Optional[str] = None,               # must be passed in
 ) -> Dict[str, object]:
     """
-    Query GNews for company-related articles and return normalized items.
+    Query GNews for company-related articles.
 
     Parameters (high-impact):
-      • company/tickers/synonyms: shape the Boolean `q` for relevance
-      • days_back: recency window; kept server-side (fewer items to filter locally)
-      • max_results/per_page: total vs per-page fetch limits (respect plan caps)
-      • search_in: scope fields to search; narrower = less noise, faster
-      • sortby: "publishedAt" for freshness or "relevance" for topicality
-      • dedupe: enable to avoid source reprints double-counting
+      • company/tickers/synonyms/extra_terms: shape the Boolean `q`
+      • days_back: recency window
+      • max_results/per_page: fetch caps (respect plan)
+      • sortby: "publishedAt" (freshness) or "relevance"
+      • token: required GNews API token (pass from env or caller)
 
-    Returns:
-      {
-        "provider": "gnews",
-        "query": <final Boolean query used>,
-        "request_url": <last request URL for debugging>,
-        "count": <number of unique items>,
-        "items": [
-          {"title": str, "url": str, "published": str(ISO8601 UTC), "source": str},
-          ...
-        ]
-      }
+    On HTTP 429:
+      • Returns the partial items gathered so far
+      • Adds 'rate_limited': True to the return dict
     """
-    # Resolve token (prefer passed arg; fallback to inline constant)
-    token = (token or GNEWS_TOKEN).strip()
-    if not token or token == "PASTE_YOUR_REAL_TOKEN_HERE":
-        raise RuntimeError("GNews token missing. Set GNEWS_TOKEN or pass token=...")
+    token = (token or "").strip()
+    if not token:
+        raise RuntimeError("GNews token missing. Pass token=...")
 
-    # Build Boolean query + time window (convert to Zulu ISO8601)
-    q = build_company_query(company, tickers=tickers, synonyms=synonyms)
+    q = build_company_query(company, tickers=tickers, synonyms=synonyms, extra_terms=extra_terms)
     now = datetime.now(timezone.utc)
     dt_from = iso8601_utc(now - timedelta(days=days_back))
     dt_to   = iso8601_utc(now)
 
-    # Normalize caps defensively (provider may enforce stricter per-request max)
     per_page = max(1, min(int(per_page), 100))
     max_results = max(1, int(max_results))
 
     s = session or make_session()
     endpoint = "https://gnews.io/api/v4/search"
 
-    # Track seen articles for de-duplication using (lower(title), lower(canonical_url))
     seen: set[Tuple[str, str]] = set()
     out: List[Dict[str, str]] = []
 
-    page = 1              # GNews uses 1-based pagination
-    fetched = 0           # number of unique items collected so far
-    last_url = endpoint   # last URL called (useful for debugging errors)
+    page = 1
+    fetched = 0
+    last_url = endpoint
+    rate_limited = False
+    retry_after_hdr: Optional[str] = None
 
-    # Loop pages until we reach max_results or results run out
     while fetched < max_results:
         n_to_fetch = min(per_page, max_results - fetched)
         params = {
-            "q": q or company,            # fallback to plain company if query is empty
+            "q": q or company,
             "lang": lang,
             "country": country,
             "from": dt_from,
             "to": dt_to,
-            "max": n_to_fetch,            # per-page limit (respect plan cap)
-            "in": search_in,              # which fields to search in
-            "sortby": sortby,             # freshness or relevance
-            "page": page,                 # current page (1-based)
-            "token": token,               # ✅ GNews expects 'token', not 'apikey'
+            "max": n_to_fetch,
+            "in": search_in,
+            "sortby": sortby,
+            "page": page,
+            "token": token,
         }
         if expand_content:
-            params["expand"] = "content"  # only on paid plans
+            params["expand"] = "content"
 
-        # Make request with timeout; keep last_url for diagnostics
         r = s.get(endpoint, params=params, timeout=timeout)
         last_url = r.url
 
-        # GNews often returns 403 for token/plan issues; show precise diagnostics
+        # 403: token/plan issue — raise with diagnostics
         if r.status_code == 403:
             try:
                 detail = r.json()
@@ -243,29 +196,31 @@ def fetch_gnews(
                 "GNews returned 403 Forbidden.\n"
                 f"- URL tried: {last_url}\n"
                 f"- Response: {detail}\n"
-                "Quick checks:\n"
+                "Checks:\n"
                 "  • Is the token valid/active?\n"
-                "  • Does your plan allow these params (e.g., max/per_page, expand)?\n"
-                "  • Try smaller max/per_page (e.g., 10) and remove 'expand'/'in' temporarily."
+                "  • Does your plan allow these params?\n"
             )
 
-        # Raise for other HTTP errors (4xx/5xx) after retries
+        # 429: rate limited — return partial items gracefully
+        if r.status_code == 429:
+            rate_limited = True
+            retry_after_hdr = r.headers.get("Retry-After")
+            break
+
+        # Other errors (after urllib3 retries)
         r.raise_for_status()
         payload = r.json()
 
-        # GNews wraps results under 'articles'
         articles = payload.get("articles", []) or []
         if not articles:
-            break  # no more results/pages
+            break
 
         for a in articles:
-            # Normalize and skip malformed rows early
             title = (a.get("title") or "").strip()
             url = canonical_url(a.get("url") or "")
-            if not url or not title:
+            if not title or not url:
                 continue
 
-            # (title, url) de-dup keeps near-identical reposts from double-counting
             key = (title.lower(), url.lower())
             if dedupe and key in seen:
                 continue
@@ -274,58 +229,48 @@ def fetch_gnews(
             out.append({
                 "title": title,
                 "url": url,
-                "published": a.get("publishedAt"),                 # UTC string per GNews docs
+                "published": a.get("publishedAt"),                  # ISO8601 UTC
                 "source": (a.get("source") or {}).get("name", ""),  # publisher label
             })
 
             fetched += 1
             if fetched >= max_results:
-                break  # stop early if we hit the cap
+                break
 
         page += 1
         if inter_page_sleep:
-            time.sleep(inter_page_sleep)  # small courtesy delay to be polite
+            time.sleep(inter_page_sleep)
 
-    # Return a compact, pipeline-friendly structure
     return {
         "provider": "gnews",
         "query": q,
         "request_url": last_url,
         "count": len(out),
         "items": out,
+        "rate_limited": rate_limited,
+        "rate_limit_retry_after": retry_after_hdr,  # may be None
     }
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 4) EXAMPLE USAGE (run this file directly)
+# Example usage
 # ───────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Example 1: NVIDIA — keep caps within free-tier defaults first
-    res_nvda = fetch_gnews(
+    import os
+    token = os.getenv("GNEWS_TOKEN")  # best practice: load from env
+
+    res = fetch_gnews(
         company="NVIDIA",
         tickers=["NVDA"],
         synonyms=["NVIDIA Corporation"],
+        extra_terms=["GPU", "AI"],     # optional
         days_back=2,
-        max_results=10,         # try 10 first; raise later if your plan allows
+        max_results=30,
         per_page=10,
-        search_in="title,description",
         sortby="publishedAt",
         token="a0a597344c0c69d79f50ddb483743b7f",
     )
-    print("[NVIDIA]", res_nvda["count"], "items")
-    print("Sample:", res_nvda["items"][:2], "\n")
-
-    # Example 2: Apple — demonstrate 'relevance' sort
-    res_aapl = fetch_gnews(
-        company="Apple Inc.",
-        tickers=["AAPL"],
-        synonyms=["Apple"],
-        days_back=3,
-        max_results=10,
-        per_page=10,
-        sortby="relevance",
-        token="a0a597344c0c69d79f50ddb483743b7f",
-    )
-    print("[Apple]", res_aapl["count"], "items")
-    print("Sample:", res_aapl["items"][:2])
-
+    print("[NVIDIA]", res["count"], "items")
+    print("rate_limited:", res.get("rate_limited"), "retry_after:", res.get("rate_limit_retry_after"))
+    print("Sample:", res["items"][:2])

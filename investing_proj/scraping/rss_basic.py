@@ -1,43 +1,83 @@
 ### 1) RSS feeds (zero-auth, super fast)
-
 """
-Company-agnostic Google News RSS fetcher (English by default)
+basic_rss.py — Company-agnostic Google News RSS fetcher (zero-auth)
 
-- Builds a boolean query like:  "NVIDIA" OR NVDA OR "NVIDIA Corporation"
-- Generates a Google News RSS search URL (lang/country default to en/US)
-- Fetches and parses items via feedparser
-- Optionally filters by recency (days_back)
-- Canonicalizes URLs (strips utm/gclid/fbclid etc.)
-- De-dupes by (title, url)
+What this module does
+---------------------
+• Builds a Boolean-style query for Google News (quoted company & synonyms, unquoted tickers)
+• Generates a Google News RSS URL (defaults: English, US region)
+• Fetches & parses items via feedparser (fast; no API key required)
+• Optionally filters by recency (days_back)
+• Canonicalizes URLs (removes tracking params) to improve de-duplication
+• De-dupes items by (lower(title), lower(canonical_url))
+• Returns a normalized structure: {title, url, published, source}
 
-Requirements:
-  pip install feedparser python-dateutil
+Why these choices
+-----------------
+• RSS is extremely fast and requires no auth—great as a first-pass "free" provider
+• Canonical URLs collapse reprints with different tracking params
+• De-dupe by (title, url) is robust enough for news feeds while keeping logic simple
+• Skipping blank titles/links keeps downstream consumers stable (no `[None]` surprises)
+
+Quick start
+-----------
+    pip install feedparser python-dateutil
+
+    from basic_rss import fetch_company_news
+    res = fetch_company_news("NVIDIA", tickers=["NVDA"], days_back=2, max_items=40)
+    print(res["count"], "items")
+    print(res["items"][:2])
 """
+
+from __future__ import annotations
 
 import feedparser
 from urllib.parse import quote_plus, urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dateparser
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
+
+# ───────────────────────────────────────────────────────────────────────────────
+# URL canonicalization
+# ───────────────────────────────────────────────────────────────────────────────
 
 def _canonical_url(url: str) -> str:
     """
     Return a canonical form of the URL by removing common tracking parameters.
     This improves de-duplication because the same article often appears with
-    different tracking query strings.
+    different campaign/query strings across sources.
+
+    Example:
+        https://site.com/post?id=123&utm_source=twitter&gclid=ABC
+    →      https://site.com/post?id=123
+
+    We purposely *keep* unknown parameters—only drop a well-known allowlist of
+    tracking keys to avoid altering meaningful query semantics.
     """
     if not url:
         return url
+
     u = urlparse(url)
-    # Remove typical tracking params
+
+    # Tracking params that don’t change content identity.
+    # Case-insensitive handling: compare on .lower().
     remove = {
         "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_name",
         "gclid", "gbraid", "wbraid", "fbclid", "mc_cid", "mc_eid"
     }
-    clean_qs = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k.lower() not in remove]
+
+    # Rebuild the query string *without* the tracking keys.
+    clean_qs = [
+        (k, v) for (k, v) in parse_qsl(u.query, keep_blank_values=True)
+        if k.lower() not in remove
+    ]
     return urlunparse(u._replace(query=urlencode(clean_qs)))
 
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Query builders & helpers
+# ───────────────────────────────────────────────────────────────────────────────
 
 def build_company_query(
     company: str,
@@ -46,29 +86,32 @@ def build_company_query(
     extra_terms: Optional[List[str]] = None,
 ) -> str:
     """
-    Build a robust boolean query for Google News.
+    Build a robust boolean-ish query string for Google News.
+
+    Rules:
+      • Company & synonyms are quoted for exact phrase matching.
+      • Tickers are left unquoted (they’re short tokens; quoting can reduce matches).
+      • extra_terms, if provided, are quoted (use to tighten relevance: ["earnings"]).
 
     Example:
-      company="NVIDIA", tickers=["NVDA"], synonyms=["NVIDIA Corporation"]
-      -> '"NVIDIA" OR "NVIDIA Corporation" OR NVDA'
+        company="NVIDIA", tickers=["NVDA"], synonyms=["NVIDIA Corporation"]
+        -> '"NVIDIA" OR "NVIDIA Corporation" OR NVDA'
 
-    Notes:
-      - We quote company names and synonyms to match exact phrases.
-      - Tickers are usually left unquoted (short tokens).
-      - You can add extra_terms (e.g., ["AI", "GPU"]) to tighten relevance.
+    Implementation detail:
+      • We preserve insertion order while de-duplicating.
     """
     tickers = tickers or []
     synonyms = synonyms or []
     extra_terms = extra_terms or []
 
-    parts = []
-    if company.strip():
-        parts.append(f'"{company.strip()}"')
+    parts: List[str] = []
+    if company and company.strip():
+        parts.append(f'"{company.strip()}"')                # exact phrase
     parts += [f'"{s.strip()}"' for s in synonyms if s and s.strip()]
-    parts += [t.strip() for t in tickers if t and t.strip()]
+    parts += [t.strip() for t in tickers if t and t.strip()]  # unquoted
     parts += [f'"{t.strip()}"' for t in extra_terms if t and t.strip()]
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order (list(dict.fromkeys(...)) trick).
     parts = list(dict.fromkeys(parts))
     return " OR ".join(parts) if parts else ""
 
@@ -77,14 +120,14 @@ def build_google_news_rss_url(query: str, lang: str = "en", country: str = "US")
     """
     Construct the Google News RSS search URL.
 
-    Parameters:
-      lang:    UI/content language (e.g., "en")
-      country: region (e.g., "US")
+    Important params:
+      • hl : UI/content language + region (e.g. "en-US")
+      • gl : Country (e.g. "US")
+      • ceid: "<COUNTRY>:<LANG>" (e.g. "US:en")
 
-    Google News expects:
-      hl=<lang-country>, gl=<country>, ceid=<country>:<lang>
-
-    Example: hl=en-US, gl=US, ceid=US:en
+    Notes:
+      • Google News *search* RSS endpoint expects a URL-encoded `q` parameter.
+      • The language/region trio makes results more consistent and predictable.
     """
     hl = f"{lang}-{country}"
     ceid = f"{country}:{lang}"
@@ -96,94 +139,146 @@ def build_google_news_rss_url(query: str, lang: str = "en", country: str = "US")
 
 def _parse_published(published_str: str) -> Optional[datetime]:
     """
-    Convert feed 'published'/'updated' strings into timezone-aware UTC datetimes.
+    Convert feed 'published'/'updated' strings into aware UTC datetimes.
     Returns None if parsing fails.
+
+    Why UTC here?
+      • Normalizing to UTC simplifies downstream time-window filtering and
+        cross-provider merges where some APIs already return Zulu timestamps.
     """
     if not published_str:
         return None
     try:
         dt = dateparser.parse(published_str)
         if dt and not dt.tzinfo:
+            # If the string lacked timezone info, assume UTC (conservative).
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
 
+def _entry_source(entry) -> str:
+    """
+    Extract a readable publisher label from a feed entry.
+
+    Google News typically provides a <source> element; feedparser exposes it
+    under entry.source as a dict-like with 'title' and 'href'. If missing, we
+    fallback to "Google News".
+
+    Returning a non-empty string helps your UI avoid awkward blanks.
+    """
+    src = None
+    s = entry.get("source")
+    if isinstance(s, dict):
+        src = s.get("title") or s.get("href")
+    if not src:
+        # Additional defensive fallbacks, just in case.
+        src = entry.get("source") or ""
+        if isinstance(src, dict):
+            src = src.get("title") or ""
+    return (src or "Google News").strip()
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Main fetcher
+# ───────────────────────────────────────────────────────────────────────────────
+
 def fetch_company_news(
     company: str,
+    *,
     tickers: Optional[List[str]] = None,
     synonyms: Optional[List[str]] = None,
-    lang: str = "en",          # <-- English default
-    country: str = "US",       # <-- United States default
-    days_back: Optional[int] = None,
-    dedupe: bool = True,
+    extra_terms: Optional[List[str]] = None,
+    lang: str = "en",                 # language for results (content/UI)
+    country: str = "US",              # region bias
+    days_back: Optional[int] = None,  # if provided, filter out items older than now - days_back
+    dedupe: bool = True,              # de-dup by (title,url) after canonicalization
+    max_items: int = 100,             # unified cap for this provider
+    max_results: Optional[int] = None # alias; if provided, overrides max_items
 ) -> Dict[str, object]:
     """
-    Fetch Google News RSS items for any company/ticker(s).
+    Fetch Google News RSS items for the given company/tickers.
 
-    Returns:
+    Parameters:
+      company      : Company name (free-form; will be quoted in the query)
+      tickers      : Optional ticker symbols (kept unquoted for better matches)
+      synonyms     : Optional alt names ("NVIDIA Corporation")
+      extra_terms  : Optional quoted terms to further constrain results
+      lang,country : Language/region hints for Google News
+      days_back    : If not None, only keep items with published >= now - days_back
+      dedupe       : If True, drop duplicates by (title, canonical_url)
+      max_items    : Upper bound on results returned (defensive cap)
+      max_results  : Alias for compatibility with other callers; overrides max_items if set
+
+    Returns a consistent dict:
       {
-        "query": <final boolean query used>,
-        "rss_url": <generated RSS URL>,
-        "count": <number of returned items>,
+        "provider": "google_news_rss",
+        "query": <final boolean query>,
+        "rss_url": <generated feed URL>,
+        "count": <unique items>,
         "items": [
-          {"title":..., "url":..., "published": <ISO8601 or None>, "source": ...},
+          {"title": str, "url": str, "published": str|None (ISO8601), "source": str},
           ...
         ]
       }
     """
-    # Build query (quoted company/synonyms + unquoted tickers)
-    q = build_company_query(company, tickers=tickers, synonyms=synonyms)
+    # Respect either max_results (alias) or max_items; enforce a reasonable upper bound.
+    cap = int(max_results) if (max_results is not None) else int(max_items)
+    cap = max(1, min(cap, 500))  # Google feeds are shallow; 500 is a very safe ceiling.
 
-    # Generate the Google News RSS endpoint (English/US by default)
-    rss_url = build_google_news_rss_url(q, lang=lang, country=country)
+    # Build the boolean-ish query. If empty (unexpected), we'll still pass the company later.
+    q = build_company_query(company, tickers=tickers, synonyms=synonyms, extra_terms=extra_terms)
 
-    # Parse the feed
+    # Generate the Google News RSS endpoint. We pass q if non-empty; otherwise company.
+    rss_url = build_google_news_rss_url(q or company, lang=lang, country=country)
+
+    # Parse the feed. feedparser returns a normalized structure across RSS/Atom variants.
     feed = feedparser.parse(rss_url)
 
-    items: List[Dict[str, Optional[str]]] = []
-    seen = set()  # for de-duplication
+    items: List[Dict[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+
+    # Compute cutoff if a recency filter was requested.
     cutoff = None
     if days_back is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
 
+    # Iterate entries in feed order. Stop early if we hit the cap.
     for e in feed.entries:
+        # Normalize required fields up front; skip malformed rows early.
         title = (e.get("title") or "").strip()
         url = _canonical_url(e.get("link") or "")
-        if not url:
+        if not title or not url:
+            # Avoid leaking None/empty into downstream code.
             continue
 
-        # Prefer 'published', fallback to 'updated'
-        published_raw = e.get("published") or e.get("updated") or ""
-        dt = _parse_published(published_raw)
+        # Parse published/updated → aware UTC datetime; may still be None for some feeds.
+        dt = _parse_published(e.get("published") or e.get("updated") or "")
 
-        # Optional recency filter
+        # Optional recency filter: only drop when we can compare a parsed timestamp.
         if cutoff and dt and dt < cutoff:
             continue
 
-        # Source/publisher label if present
-        src = "Google News"
-        if isinstance(e.get("source"), dict):
-            src = (e.get("source") or {}).get("title") or src
-
-        record = {
+        rec = {
             "title": title,
             "url": url,
-            "published": dt.isoformat() if dt else None,
-            "source": src,
+            "published": dt.replace(microsecond=0).isoformat() if dt else None,
+            "source": _entry_source(e),
         }
 
-        # Simple de-dup on (title, canonical_url)
-        if dedupe:
-            key = (record["title"].lower(), record["url"].lower())
-            if key in seen:
-                continue
-            seen.add(key)
+        # Lightweight de-dupe: (lower(title), lower(url)) after canonicalization.
+        key = (rec["title"].lower(), rec["url"].lower())
+        if dedupe and key in seen:
+            continue
+        seen.add(key)
 
-        items.append(record)
+        items.append(rec)
+        if len(items) >= cap:
+            break
 
     return {
+        "provider": "google_news_rss",
         "query": q,
         "rss_url": rss_url,
         "count": len(items),
@@ -191,16 +286,26 @@ def fetch_company_news(
     }
 
 
-# -----------------------
+# ───────────────────────────────────────────────────────────────────────────────
 # Example usage (English/US)
-# -----------------------
+# ───────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # 1) NVIDIA example (English, US)
-    out_nvda = fetch_company_news("NVIDIA", tickers=["NVDA"], days_back=2)
+    # Example 1: NVIDIA — fetch recent items (up to 40) in English/US.
+    # Example 1: NVIDIA — fetch recent items with all options set
+    out_nvda = fetch_company_news(
+        company="NVIDIA",  # required
+        tickers=["NVDA"],  # optional: unquoted tokens
+        synonyms=["NVIDIA Corporation"],  # optional: quoted phrases
+        extra_terms=["GPU", "AI"],  # optional: quoted phrases to tighten relevance
+        lang="en",  # UI/content language (default: "en")
+        country="US",  # region bias (default: "US")
+        days_back=3,  # optional recency filter (None = no filter)
+        dedupe=True,  # de-dup on (title, canonical_url) (default: True)
+        max_items=100,  # upper bound for this provider (default: 100)
+        # max_results=100,                 # alias; if set, it overrides max_items
+    )
+
     print(out_nvda["rss_url"])
     print("Items:", out_nvda["count"])
-
-    # 2) Apple example (English, US)
-    out_aapl = fetch_company_news("Apple Inc.", tickers=["AAPL"], days_back=2)
-    print(out_aapl["rss_url"])
-    print("Items:", out_aapl["count"])
+    print(out_nvda["items"][:2])
