@@ -16,8 +16,8 @@ res = fetch_all_news(
     synonyms=["NVIDIA Corporation"],
     # extra_terms=["GPU", "AI"],
     # supply creds if you have them:
-    gnews_token= "a0a597344c0c69d79f50ddb483743b7f",
-    newsapi_key= "61b3e308bbf043789e83e53288f294be",
+    gnews_token= "TOKEN",
+    newsapi_key= "TOKEN",
 )
 
 

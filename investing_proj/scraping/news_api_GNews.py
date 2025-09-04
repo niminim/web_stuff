@@ -269,7 +269,7 @@ if __name__ == "__main__":
         max_results=30,
         per_page=10,
         sortby="publishedAt",
-        token="a0a597344c0c69d79f50ddb483743b7f",
+        token="TOKEN",
     )
     print("[NVIDIA]", res["count"], "items")
     print("rate_limited:", res.get("rate_limited"), "retry_after:", res.get("rate_limit_retry_after"))

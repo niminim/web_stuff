@@ -248,8 +248,7 @@ def fetch_newsapi(company: str,
 # ───────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import os
-    key = os.getenv("NEWSAPI_KEY")
+
     res = fetch_newsapi(
         company="NVIDIA",
         tickers=["NVDA"],
@@ -260,7 +259,7 @@ if __name__ == "__main__":
         page_size=10,
         search_in="title,description",
         sort_by="publishedAt",
-        api_key="61b3e308bbf043789e83e53288f294be",
+        api_key="TOKEN",
     )
     print("[NVIDIA]", res["count"], "items")
     print("rate_limited:", res.get("rate_limited"), "retry_after:", res.get("rate_limit_retry_after"))
