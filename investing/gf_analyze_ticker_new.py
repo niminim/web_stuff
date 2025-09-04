@@ -446,7 +446,6 @@ def get_financial_data_for_ticker(
 
 if __name__ == "__main__":
     tickers: List[str] = ["SMR", "NVDA"]
-    tickers: List[str] = ["TTI", "NVDA"]
 
     out_csv = "/home/nim/Downloads/gurufocus_scrapes.csv"
 
@@ -476,3 +475,8 @@ if __name__ == "__main__":
         print(preview_df.iloc[:, :7].head())
 
     print(f"\nSaved data for {len(all_rows)} tickers to {out_csv}")
+
+# no specific need for using this wrapper, could use scrape_tickers only.
+# this one is just more straight-forward
+ticker = 'NVDA'
+main_scores, other_indicators = get_financial_data_for_ticker(ticker, print_all_data=True)
