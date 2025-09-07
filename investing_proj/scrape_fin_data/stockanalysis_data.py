@@ -1,19 +1,27 @@
 """
-StockAnalysis scraper — Overview + Financials + TTM dict + Technicals + Short Info
-----------------------------------------------------------------------------------
+StockAnalysis scraper — Overview + Financials + TTM dict + Technicals + Short Info + Historical Data
+----------------------------------------------------------------------------------------------------
 
 Public API:
     bundle = get_company_bundle("NVDA")
 
     bundle.keys() ->
-        dict_keys(['overview', 'financials_dfs', 'financials_ttm_dict', 'technicals', 'short_info'])
+        dict_keys([
+            'overview',
+            'financials_dfs',
+            'financials_ttm_dict',
+            'technicals',
+            'short_info',
+            'historical_data',   # <-- NEW last key
+        ])
 
 Contents:
-    - overview: dict (exact 18 snapshot fields)
+    - overview: dict (18 snapshot fields)
     - financials_dfs: dict[str, DataFrame] -> income / balance_sheet / cash_flow / ratios
     - financials_ttm_dict: dict[str, dict[str, str|None]] -> latest (TTM/Current) per row label
-    - technicals: dict (price stats block from /statistics/)
-    - short_info: dict (short selling block from /statistics/)
+    - technicals: dict (price stats from /statistics/)
+    - short_info: dict (short selling from /statistics/)
+    - historical_data: DataFrame (Date, Open, High, Low, Close, Volume, Change)
 
 Run:
     python this_file.py
@@ -22,13 +30,13 @@ Run:
 from __future__ import annotations
 import json
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup, Tag, NavigableString
-
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 # =============================================================================
 # Networking (fast & robust)
@@ -60,13 +68,11 @@ def make_session() -> requests.Session:
     s.mount("http://", adapter)
     return s
 
-
 def fetch_html(url: str, session: requests.Session, timeout: int = 12) -> str:
     """GET a page and return its HTML."""
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
     return r.text
-
 
 # =============================================================================
 # Text helpers + label→value DOM finder (class-agnostic)
@@ -75,12 +81,6 @@ def _normalize_text(s: str) -> str:
     s = re.sub(r"[^\w\s%-./,$]", "", s or "").strip()
     s = re.sub(r"\s+", " ", s)
     return s
-
-
-def _canon_map(keys: list[str]) -> dict[str, str]:
-    """Map 'normalized' label -> canonical label."""
-    return {re.sub(r"[^\w\s]", "", k).lower(): k for k in keys}
-
 
 def _find_value_next_to_label(root: Tag, label_text: str) -> Optional[str]:
     """
@@ -128,7 +128,6 @@ def _find_value_next_to_label(root: Tag, label_text: str) -> Optional[str]:
                     if val and val.lower() != target_norm:
                         return val
     return None
-
 
 # =============================================================================
 # Financial table parsing (hardened)
@@ -181,11 +180,9 @@ def parse_table_to_df(html: str) -> Optional[pd.DataFrame]:
         df.rename(columns={"Company Name": "Company"}, inplace=True)
     return df
 
-
 def get_data_table(url: str, session: requests.Session) -> Optional[pd.DataFrame]:
     html = fetch_html(url, session)
     return parse_table_to_df(html)
-
 
 # =============================================================================
 # Financials: fetch 4 tables in parallel
@@ -213,7 +210,6 @@ def fetch_financial_dfs(ticker: str, session: requests.Session) -> Dict[str, Opt
                 print(f"[warn] {ticker} {k}: {e}")
                 out[k] = None
     return out
-
 
 def build_financials_ttm_dict(financials_dfs: Dict[str, Optional[pd.DataFrame]]) -> Dict[str, Dict[str, Optional[str]]]:
     """
@@ -249,7 +245,6 @@ def build_financials_ttm_dict(financials_dfs: Dict[str, Optional[pd.DataFrame]])
         latest[key] = d
     return latest
 
-
 # =============================================================================
 # Overview snapshot (18 canonical fields) — robust JSON + DOM fallback
 # =============================================================================
@@ -276,7 +271,6 @@ def _find_first_key(obj, candidates):
             if hit is not None:
                 return hit
     return None
-
 
 def get_company_overview(ticker: str, session: requests.Session) -> Optional[Dict[str, str]]:
     """
@@ -339,7 +333,6 @@ def get_company_overview(ticker: str, session: requests.Session) -> Optional[Dic
     # Return only the canonical fields, in order
     return {k: out[k] for k in CANONICAL_OVERVIEW_FIELDS if k in out}
 
-
 # =============================================================================
 # /statistics/: Technicals + Short info
 # =============================================================================
@@ -387,47 +380,248 @@ def get_statistics_blocks(ticker: str, session: requests.Session) -> dict[str, d
         return None
     return {"technicals": technicals, "short_info": short_info}
 
+# =============================================================================
+# Historical Data — robust table + pagination
+# =============================================================================
+HIST_HEADERS_MUST_HAVE = {"Date", "Open", "High", "Low", "Close", "Volume"}  # Change is optional but expected
 
-# =============================================================================
-# Public API: one call that fetches everything in parallel
-# =============================================================================
-def get_company_bundle(ticker: str) -> Dict[str, object]:
+def _find_history_table(soup: BeautifulSoup) -> Optional[Tag]:
+    """Locate the historical data table by checking for expected headers."""
+    for tbl in soup.find_all("table"):
+        ths = [th.get_text(strip=True) for th in tbl.find_all("th")]
+        if not ths:
+            continue
+        if HIST_HEADERS_MUST_HAVE.issubset(set(ths)):
+            return tbl
+    return None
+
+def _parse_history_table(tbl: Tag) -> pd.DataFrame:
+    """Parse a historical data table (<table> Tag) into a DataFrame with header/rows."""
+    headers = [th.get_text(strip=True) for th in tbl.find_all("th")]
+    rows: List[List[str]] = []
+    for tr in tbl.find_all("tr")[1:]:
+        cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+        if cells:
+            # normalize row length to header count
+            if len(cells) < len(headers):
+                cells += [""] * (len(headers) - len(cells))
+            elif len(cells) > len(headers):
+                cells = cells[:len(headers)]
+            rows.append(cells)
+    df = pd.DataFrame(rows, columns=headers)
+    return df
+
+def _clean_history_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize dtypes for historical data."""
+    out = df.copy()
+
+    # Keep only known columns (if site adds extras, we ignore them)
+    keep_cols = [c for c in out.columns if c in {"Date","Open","High","Low","Close","Volume","Change"}]
+    out = out[keep_cols]
+
+    # Date → datetime
+    if "Date" in out.columns:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+
+    # Prices → float
+    for c in ["Open","High","Low","Close"]:
+        if c in out.columns:
+            out[c] = (
+                out[c].str.replace("$","", regex=False)
+                      .str.replace(",","", regex=False)
+                      .replace({"": None, "—": None, "-": None})
+            )
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # Volume → Int64
+    if "Volume" in out.columns:
+        out["Volume"] = (
+            out["Volume"].str.replace(",","", regex=False)
+                         .replace({"": None, "—": None, "-": None})
+        )
+        out["Volume"] = pd.to_numeric(out["Volume"], errors="coerce").astype("Int64")
+
+    # Change (percentage) → fraction float
+    if "Change" in out.columns:
+        s = out["Change"].astype(str)
+        s = s.str.replace("%","", regex=False).str.replace(",","", regex=False)
+        s = s.replace({"": None, "—": None, "-": None})
+        out["Change"] = pd.to_numeric(s, errors="coerce")/100.0
+
+    return out
+
+def _find_next_page_url(soup: BeautifulSoup, base_url: str) -> Optional[str]:
     """
-    Fetch overview + financials + TTM dict + technicals + short info.
+    Detect a 'Next' page link for history pagination. We look for:
+      - rel="next"
+      - an <a> with '?p=N+1' relative to current page
+    """
+    # rel="next"
+    a = soup.find("a", attrs={"rel": "next"})
+    if a and a.get("href"):
+        return urljoin(base_url, a["href"])
 
-    Returns dict with keys:
-        ['overview', 'financials_dfs', 'financials_ttm_dict', 'technicals', 'short_info']
+    # heuristic: look for links with '?p=' and pick the next number
+    candidates = []
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        if "?p=" in href:
+            candidates.append(urljoin(base_url, href))
+    if not candidates:
+        return None
+    # Choose the highest page number link greater than current
+    # Parse current p
+    parsed = urlparse(base_url)
+    q = parse_qs(parsed.query)
+    cur_p = int(q.get("p", [1])[0])
+    nexts = []
+    for u in candidates:
+        pu = urlparse(u)
+        pq = parse_qs(pu.query)
+        pnum = int(pq.get("p", [0])[0]) if "p" in pq else 0
+        if pnum > cur_p:
+            nexts.append((pnum, u))
+    if not nexts:
+        return None
+    nexts.sort()
+    return nexts[0][1]
+
+def _ensure_page(url: str, page: int) -> str:
+    """Ensure URL has ?p=page; if already has query params, replace p; else add it."""
+    pu = urlparse(url)
+    q = parse_qs(pu.query)
+    q["p"] = [str(page)]
+    new_q = urlencode({k: v[0] for k, v in q.items()})
+    return urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, new_q, pu.fragment))
+
+def get_historical_data(
+    ticker: str,
+    session: requests.Session,
+    max_pages: int = 1
+) -> Optional[pd.DataFrame]:
+    """
+    Scrape historical OHLCV table with pagination.
+
+    Strategy:
+      - Try /history/ first, then /historical/ fallback
+      - For each page, locate the history table by header check (class-agnostic)
+      - Append rows across pages up to max_pages or until no next page
+      - Clean dtypes & return a single DataFrame sorted DESC by Date
+    """
+    base_candidates = [
+        f"https://stockanalysis.com/stocks/{ticker.lower().strip()}/history/",
+        f"https://stockanalysis.com/stocks/{ticker.lower().strip()}/historical/",
+    ]
+
+    all_pages: List[pd.DataFrame] = []
+
+    for base in base_candidates:
+        try:
+            # page 1
+            html = fetch_html(base, session)
+            soup = BeautifulSoup(html, "html.parser")
+            tbl = _find_history_table(soup)
+            if tbl is None:
+                # Try next candidate base
+                continue
+
+            # first page
+            df1 = _parse_history_table(tbl)
+            if not df1.empty:
+                all_pages.append(df1)
+
+            # follow ?p=2..N up to max_pages
+            page = 1
+            while page < max_pages:
+                # Prefer explicit p=page+1 if possible
+                page += 1
+                next_url = _ensure_page(base, page)
+
+                try:
+                    html_n = fetch_html(next_url, session)
+                except Exception:
+                    # If explicit p=N fails, try discoverable "next" link
+                    next_url = _find_next_page_url(soup, base)
+                    if not next_url:
+                        break
+                    html_n = fetch_html(next_url, session)
+
+                soup = BeautifulSoup(html_n, "html.parser")
+                tbl = _find_history_table(soup)
+                if tbl is None:
+                    break
+                dfn = _parse_history_table(tbl)
+                if dfn is None or dfn.empty:
+                    break
+                all_pages.append(dfn)
+
+            # If we reached here with at least one page, stop trying fallbacks
+            if all_pages:
+                break
+
+        except Exception:
+            # Try the next candidate base URL
+            continue
+
+    if not all_pages:
+        return None
+
+    raw = pd.concat(all_pages, ignore_index=True)
+    cleaned = _clean_history_df(raw)
+
+    # Drop rows without a valid Date; keep unique rows; sort by Date DESC (site style)
+    if "Date" in cleaned.columns:
+        cleaned = cleaned.dropna(subset=["Date"]).drop_duplicates().sort_values("Date", ascending=False).reset_index(drop=True)
+
+    return cleaned
+
+# =============================================================================
+# Public API: one call that fetches everything in parallel (+ historical last)
+# =============================================================================
+def get_company_data(
+    ticker: str,
+    *,
+    history_pages: int = 1  # increase to pull more pages of historical data
+) -> Dict[str, object]:
+    """
+    Fetch overview + financials + TTM dict + technicals + short info + historical data.
+
+    Returns dict with keys (in this order):
+        ['overview', 'financials_dfs', 'financials_ttm_dict', 'technicals', 'short_info', 'historical_data']
     """
     session = make_session()
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         fut_overview   = ex.submit(get_company_overview, ticker, session)
         fut_financials = ex.submit(fetch_financial_dfs, ticker, session)
         fut_stats      = ex.submit(get_statistics_blocks, ticker, session)
+        fut_history    = ex.submit(get_historical_data, ticker, session, history_pages)
 
         overview     = fut_overview.result()
         fin_dfs      = fut_financials.result()
         stats_blocks = fut_stats.result() or {"technicals": {}, "short_info": {}}
+        history_df   = fut_history.result()
 
     fin_ttm = build_financials_ttm_dict(fin_dfs)
 
+    # Important: ensure 'historical_data' is the LAST key when printed (Python 3.7+ preserves insertion order)
     return {
         "overview": overview,
         "financials_dfs": fin_dfs,
         "financials_ttm_dict": fin_ttm,
         "technicals": stats_blocks.get("technicals", {}),
         "short_info": stats_blocks.get("short_info", {}),
+        "historical_data": history_df,
     }
-
 
 # =============================================================================
 # Example run
 # =============================================================================
 if __name__ == "__main__":
     ticker = "NVDA"
-    data = get_company_bundle(ticker)
+    data = get_company_data(ticker, history_pages=3)  # pull 3 pages of history
 
-    print("\n=== BUNDLE KEYS ===")
-    print(data.keys())  # dict_keys(['overview','financials_dfs','financials_ttm_dict','technicals','short_info'])
+    print("\n=== DATA KEYS ===")
+    print(data.keys())
 
     print("\n=== OVERVIEW (subset) ===")
     if data["overview"]:
@@ -450,3 +644,10 @@ if __name__ == "__main__":
 
     print("\n=== FINANCIALS_TTM_DICT (sample) ===")
     print("Ratios -> PE Ratio:", data["financials_ttm_dict"].get("ratios", {}).get("PE Ratio"))
+
+    print("\n=== HISTORICAL_DATA (head) ===")
+    hist = data["historical_data"]
+    if hist is None or hist.empty:
+        print("No historical data found.")
+    else:
+        print(hist.head())

@@ -152,7 +152,7 @@ for base_url in urls:
         # Sleep for 2 seconds between requests to avoid overwhelming the server and reduce the risk of being blocked
         time.sleep(2)
 
-# After scraping all pages, create a DataFrame to store the filtered data
+# After scrape_articles all pages, create a DataFrame to store the filtered data
 data = {
     'Title': all_titles,
     'Author': all_authors,

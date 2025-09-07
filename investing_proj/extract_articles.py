@@ -7,7 +7,7 @@ project_root = os.path.abspath("/home/nim/venv/web_stuff/investing_proj")
 sys.path.append(project_root)
 print(sys.path)
 
-from scraping.news_fetchers import fetch_all_news
+from scrape_articles.news_fetchers import fetch_all_news
 
 # Example: NVIDIA
 res = fetch_all_news(
@@ -45,6 +45,6 @@ for i, it in enumerate(gitems[:5], 1):
 
 # only newsapi
 newsapiitems = [x for x in res["merged"]["items"] if x.get("provider") == "newsapi"]
-print("GNews (merged) count:", len(newsapiitems))
+print("NewsAPI (merged) count:", len(newsapiitems))
 for i, it in enumerate(newsapiitems[:5], 1):
     print(f"{i}. [{it['provider']}] {it['source']} — {it['title']} ({it['published']})")

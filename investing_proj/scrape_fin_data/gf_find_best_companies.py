@@ -72,8 +72,6 @@
 
 
 ################ New Code:
-import numpy as np
-import pandas as pd
 from typing import List, Optional
 import os
 import sys
@@ -81,10 +79,10 @@ import sys
 import numpy as np
 import pandas as pd
 
-project_root = os.path.abspath("/home/nim/venv/web_stuff")
+project_root = os.path.abspath("/")
 sys.path.append(project_root)
 
-from investing.gf_analyze_ticker_new import get_financial_data_for_ticker
+from investing_proj.financial_data.gf_analyze_ticker_new import get_financial_data_for_ticker
 
 # -------------------------------
 # Helpers

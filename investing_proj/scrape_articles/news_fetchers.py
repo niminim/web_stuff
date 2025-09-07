@@ -31,7 +31,7 @@ from typing import Dict, Any, List, Optional, Iterable, Tuple
 import os
 import sys
 
-project_root = os.path.abspath("/home/nim/venv/web_stuff/investing_proj/scraping")
+project_root = os.path.abspath("/investing_proj/scrape_articles")
 sys.path.append(project_root)
 print(sys.path)
 
