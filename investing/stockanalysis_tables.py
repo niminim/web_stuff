@@ -1,230 +1,368 @@
-import requests
-from bs4 import BeautifulSoup
+"""
+StockAnalysis scraper — overview (robust) + financial tables
+
+Run:
+    data = get_company_data("NVDA")
+    print(pd.Series(data["overview"]))
+"""
+
+from __future__ import annotations
+import json, re
+from typing import Dict, Optional
 import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from bs4 import BeautifulSoup, NavigableString, Tag
 
+# =============================================================================
+# Networking
+# =============================================================================
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0 Safari/537.36"
+        )
+    })
+    retry = Retry(total=3, backoff_factor=0.4,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset(["GET"]))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
-###  The code gets a url that includes a table of companies a the table as a dataframe
-### I can also get the full financial data from Stockanalysis
+def fetch_html(url: str, session: requests.Session, timeout: int = 12) -> str:
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.text
 
-
-# https://stockanalysis.com/list/
-sp500_url = 'https://stockanalysis.com/list/sp-500-stocks/'
-nasdaq100_rul = 'https://stockanalysis.com/list/nasdaq-100-stocks/'
-nasdaq_url = 'https://stockanalysis.com/list/nasdaq-stocks/'
-nyse_url = 'https://stockanalysis.com/list/nyse-stocks/'
-israeli_us_url= 'https://stockanalysis.com/list/israeli-stocks-us/'
-ipos_url = 'https://stockanalysis.com/ipos/'
-
-# Custom headers to mimic a browser
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
-
-# Function to fetch the HTML content of the page
-def fetch_html(url):
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.text
-    else:
-        print(f"Failed to retrieve data. Status code: {response.status_code}")
-        return None
-
-
-# Function to parse the table data from HTML content
-def parse_table_data(html_content):
-    # parse the data table
-    soup = BeautifulSoup(html_content, 'html.parser')
-
-    # Find the table in the page content
-    table = soup.find('table')
-
+# =============================================================================
+# Table parser
+# =============================================================================
+def parse_table_to_df(html: str) -> Optional[pd.DataFrame]:
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
     if not table:
-        print("Table not found on the page.")
-        return None, None
-
-    # Extract table headers
-    headers = []
-    for header in table.find_all('th'):
-        headers.append(header.get_text().strip())
-
-    # Extract table rows
-    rows = []
-    for row in table.find_all('tr')[1:]:  # Skip the header row
-        cells = row.find_all('td')
-        row_data = [cell.get_text().strip() for cell in cells]
-        rows.append(row_data)
-
-    return headers, rows
-
-
-def clean_headers(headers):
-    # Find the index of 'Period Ending'
-
-    cleaned = False
-    if 'Period Ending' in headers:
-        index = headers.index('Period Ending')
-        # Slice the list to include only the headers before 'Period Ending'
-        headers = headers[:index]
-        cleaned = True
-    return headers, cleaned
-
-# Main function to get the S&P 500 table data
-def get_data_table(url):
-    # Fetch the page content
-    html_content = fetch_html(url)
-
-    if html_content:
-        # Parse the table data
-        headers, table_data = parse_table_data(html_content)
-        headers, cleaned = clean_headers(headers) # throw second row of categories
-
-        # Convert the table data to a pandas DataFrame
-        df = pd.DataFrame(table_data, columns=headers)
-        df.rename(columns={'Company Name': 'Company'}, inplace=True)
-
-        if cleaned:
-            # Drop the row with index 0
-            ratios_cleaned = df.drop(index=0)
-
-            # Reset index if needed
-            ratios_cleaned.reset_index(drop=True, inplace=True)
-
-        return df
-    else:
         return None
 
+    thead = table.find("thead")
+    hrow = thead.find("tr") if thead else table.find("tr")
+    hdr_cells = hrow.find_all(["th", "td"]) if hrow else []
+    headers = [c.get_text(strip=True) for c in hdr_cells]
 
-# Define the function to fetch and process financial data for a specific company
-def get_company_financials_as_df(ticker):
-    # the functions gets a company ticker and returs a dictionary of financial tables (each as a dataframe)
-    financials_urls = {
-        'income': f"https://stockanalysis.com/stocks/{ticker}/financials/",
-        'balance_sheet': f"https://stockanalysis.com/stocks/{ticker}/financials/balance-sheet/",
-        'cash_flow': f"https://stockanalysis.com/stocks/{ticker}/financials/cash-flow-statement/",
-        'ratios': f"https://stockanalysis.com/stocks/{ticker}/financials/ratios/"
-    }
+    if "Period Ending" in headers:
+        headers = headers[: headers.index("Period Ending")]
 
-    df = {key: get_data_table(url) for key, url in financials_urls.items()}
+    n_cols = len(headers)
+    if n_cols == 0:
+        return None
+
+    rows = []
+    for tr in table.find_all("tr"):
+        if tr.find_parent("thead"):
+            continue
+        cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+        if not cells:
+            continue
+        if len(cells) >= n_cols:
+            cells = cells[:n_cols]
+        else:
+            cells += [""] * (n_cols - len(cells))
+        if cells == headers:
+            continue
+        rows.append(cells)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=headers)
+    if "Company Name" in df.columns:
+        df.rename(columns={"Company Name": "Company"}, inplace=True)
     return df
 
+def get_data_table(url: str, session: requests.Session) -> Optional[pd.DataFrame]:
+    html = fetch_html(url, session)
+    return parse_table_to_df(html)
 
-def get_full_data_from_table_dfs(comp_df):
-    """
-    Build a nested dictionary from the financials DataFrames of a company.
+# =============================================================================
+# Financials
+# =============================================================================
+FIN_URLS = {
+    "income":        "https://stockanalysis.com/stocks/{t}/financials/",
+    "balance_sheet": "https://stockanalysis.com/stocks/{t}/financials/balance-sheet/",
+    "cash_flow":     "https://stockanalysis.com/stocks/{t}/financials/cash-flow-statement/",
+    "ratios":        "https://stockanalysis.com/stocks/{t}/financials/ratios/",
+}
 
-    Output structure:
-        full_data_dict[table_key][row_label] = value
+def fetch_financial_dfs(ticker: str, session: requests.Session) -> Dict[str, Optional[pd.DataFrame]]:
+    t = ticker.lower().strip()
+    out: Dict[str, Optional[pd.DataFrame]] = {k: None for k in FIN_URLS}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut2key = {
+            ex.submit(get_data_table, url.format(t=t), session): k
+            for k, url in FIN_URLS.items()
+        }
+        for fut in as_completed(fut2key):
+            k = fut2key[fut]
+            try:
+                out[k] = fut.result()
+            except Exception as e:
+                print(f"[warn] {ticker} {k}: {e}")
+                out[k] = None
+    return out
 
-    - For 'ratios' tables, values come from the 'Current' column.
-    - For other tables (income, balance sheet, cash flow), values come from 'TTM'.
-    - If the expected column doesn't exist, fallback logic is applied.
-
-    Example:
-        full_data_dict['ratios']['Debt / Equity Ratio'] -> "value"
-    """
-
-    def _find_label_col(df):
-        """
-        Try to detect which column holds the row labels (e.g., 'Fiscal Year', 'Metric').
-        StockAnalysis uses different names depending on the table type.
-
-        Returns:
-            Name of the label column.
-        """
-        candidates = [
-            'Fiscal Year', 'Year Ending', 'Period Ending',
-            'Metric', 'Breakdown', 'Category', 'Item'
-        ]
-        for c in candidates:
+def dfs_to_latest(financials_dfs: Dict[str, Optional[pd.DataFrame]]) -> Dict[str, Dict[str, Optional[str]]]:
+    def label_col(df: pd.DataFrame) -> str:
+        for c in ("Fiscal Year", "Year Ending", "Period Ending",
+                  "Metric", "Breakdown", "Category", "Item"):
             if c in df.columns:
                 return c
-        # If none of the candidates are found, fallback to the first column
         return df.columns[0]
 
-    # Main dictionary to store all tables for the company
-    full_data_dict = {}
-
-    # Iterate over each financial table: income, balance_sheet, cash_flow, ratios
-    for key, df in comp_df.items():
-        # Handle missing or empty DataFrames
+    latest: Dict[str, Dict[str, Optional[str]]] = {}
+    for key, df in financials_dfs.items():
         if df is None or df.empty:
-            full_data_dict[key] = {}
+            latest[key] = {}
             continue
 
-        # Detect the column that contains row labels (categories, fiscal years, metrics, etc.)
-        label_col = _find_label_col(df)
+        lbl = label_col(df)
+        val_col = "Current" if key == "ratios" else "TTM"
+        if val_col not in df.columns:
+            nonlbl = [c for c in df.columns if c != lbl]
+            val_col = nonlbl[-1] if nonlbl else df.columns[-1]
 
-        # Decide which column to use for numeric values
-        # - Ratios tables → 'Current'
-        # - Others        → 'TTM'
-        value_col = 'Current' if key == 'ratios' else 'TTM'
+        d: Dict[str, Optional[str]] = {}
+        for category in df[lbl].dropna().astype(str).tolist():
+            row = df[df[lbl] == category]
+            d[category] = row.iloc[0][val_col] if (not row.empty and val_col in row.columns) else None
+        latest[key] = d
+    return latest
 
-        # If the expected column is not found, pick the last non-label column as a fallback
-        if value_col not in df.columns:
-            numeric_like = [c for c in df.columns if c != label_col]
-            value_col = numeric_like[-1] if numeric_like else df.columns[-1]
+# =============================================================================
+# Overview – canonical fields & helpers
+# =============================================================================
+CANONICAL_FIELDS = [
+    "Market Cap", "Revenue (ttm)", "Net Income (ttm)", "Shares Out",
+    "EPS (ttm)", "PE Ratio", "Forward PE", "Dividend", "Ex-Dividend Date",
+    "Volume", "Open", "Previous Close", "Day's Range", "52-Week Range",
+    "Beta", "Analysts", "Price Target", "Earnings Date"
+]
 
-        # Initialize dictionary for this specific table
-        full_data_dict[key] = {}
+def _normalize_text(s: str) -> str:
+    s = re.sub(r"[^\w\s%-./]", "", s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-        # Loop through each row label (e.g., "Debt / Equity Ratio", "2023", "Net Income")
-        for category in df[label_col].dropna().tolist():
-            # Extract the row corresponding to this category
-            row = df[df[label_col] == category]
+def _canonize_label(label: str) -> str | None:
+    lab = _normalize_text(label).lower()
+    canon_map = {re.sub(r"[^\w\s]", "", k).lower(): k for k in CANONICAL_FIELDS}
+    return canon_map.get(re.sub(r"[^\w\s]", "", lab))
 
-            # If the row exists and the value column is present, extract the value
-            if not row.empty and value_col in row.columns:
-                full_data_dict[key][category] = row.iloc[0][value_col]
-            else:
-                # If something is missing, store None to avoid KeyErrors later
-                full_data_dict[key][category] = None
-
-    return full_data_dict
-
-
-def get_company_overview(ticker):
-    """
-    Scrapes the overview table (Market Cap, PE Ratio, Dividend, etc.)
-    from the company's main stockanalysis.com page.
-    Returns a dictionary.
-    """
-    url = f"https://stockanalysis.com/stocks/{ticker}/"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Failed to fetch {ticker} overview. Status: {response.status_code}")
+def _format_range(lo, hi):
+    if lo is None or hi is None:
         return None
+    return f"{lo} - {hi}"
 
-    soup = BeautifulSoup(response.text, "html.parser")
+def _find_first_key(obj, candidates):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in candidates:
+                return v
+        for v in obj.values():
+            hit = _find_first_key(v, candidates)
+            if hit is not None:
+                return hit
+    elif isinstance(obj, list):
+        for it in obj:
+            hit = _find_first_key(it, candidates)
+            if hit is not None:
+                return hit
+    return None
 
-    overview_dict = {}
+# ---- DOM value finder (class-agnostic) ----
+def _find_value_next_to_label(root: Tag, label_text: str) -> Optional[str]:
+    """
+    Find the text value visually 'next to' a label anywhere in the DOM:
+    - search any element whose normalized text matches label_text
+    - within the same parent/row, pick the nearest sibling text that looks like the value
+    This tolerates changing class names and grid systems.
+    """
+    target_norm = _normalize_text(label_text).lower()
 
-    # The overview table appears as multiple <div> elements with pairs of label + value
-    # Look for them inside "snapshot" sections
-    snapshot_sections = soup.find_all("div", class_="snapshot__data-item")
-    if not snapshot_sections:
-        print(f"No overview table found for {ticker}")
+    def match_label(node: Tag) -> bool:
+        if not isinstance(node, Tag):
+            return False
+        txt = _normalize_text(node.get_text(" ", strip=True)).lower()
+        return txt == target_norm
+
+    candidates = root.find_all(match_label)
+    for lab in candidates:
+        parent = lab.parent
+        if not isinstance(parent, Tag):
+            continue
+
+        # 1) Try immediate next siblings in the same row/container
+        for sib in lab.next_siblings:
+            if isinstance(sib, NavigableString):
+                continue
+            if isinstance(sib, Tag):
+                val = _normalize_text(sib.get_text(" ", strip=True))
+                if val and val.lower() != target_norm:
+                    return val
+
+        # 2) Try other children in the same parent (label/value pairs)
+        children = [c for c in parent.children if isinstance(c, Tag)]
+        if len(children) >= 2:
+            for i, c in enumerate(children):
+                if c is lab and i + 1 < len(children):
+                    val = _normalize_text(children[i + 1].get_text(" ", strip=True))
+                    if val and val.lower() != target_norm:
+                        return val
+
+        # 3) Go one level up and scan siblings (two-column rows)
+        gp = parent.parent
+        if isinstance(gp, Tag):
+            elems = [e for e in gp.children if isinstance(e, Tag)]
+            if len(elems) >= 2:
+                for i, e in enumerate(elems):
+                    if lab in e.descendants and i + 1 < len(elems):
+                        val = _normalize_text(elems[i + 1].get_text(" ", strip=True))
+                        if val and val.lower() != target_norm:
+                            return val
+    return None
+
+# =============================================================================
+# Overview scraper (hardened)
+# =============================================================================
+def get_company_overview(ticker: str, session: requests.Session) -> Optional[Dict[str, str]]:
+    """
+    Extract the 18 canonical overview fields using multiple strategies:
+      A) __NEXT_DATA__ JSON keys (if present)
+      B) any <script type="application/ld+json"> blocks
+      C) class-agnostic DOM pairing of label -> nearest value
+    Returns a dict with only the 18 fields (any missing are omitted).
+    """
+    url = f"https://stockanalysis.com/stocks/{ticker.lower().strip()}/"
+    html = fetch_html(url, session)
+    soup = BeautifulSoup(html, "html.parser")
+    out: Dict[str, str] = {}
+
+    # --- A) Next.js boot JSON ---
+    try:
+        tag = soup.find("script", id="__NEXT_DATA__")
+        if tag and tag.string:
+            boot = json.loads(tag.string)
+
+            keymap = {
+                "Market Cap":        {"marketCap", "marketcap", "market_cap"},
+                "Revenue (ttm)":     {"revenueTtm", "revenueTTM", "revenueTrailing12M"},
+                "Net Income (ttm)":  {"netIncomeTtm", "netIncomeTTM", "netIncomeTrailing12M"},
+                "Shares Out":        {"sharesOutstanding", "sharesOut"},
+                "EPS (ttm)":         {"epsTtm", "epsTrailingTwelveMonths"},
+                "PE Ratio":          {"peRatio", "pe"},
+                "Forward PE":        {"forwardPE", "forwardPe"},
+                "Dividend":          {"dividendYield", "dividendRate", "dividend"},
+                "Ex-Dividend Date":  {"exDividendDate"},
+                "Volume":            {"volume"},
+                "Open":              {"open"},
+                "Previous Close":    {"previousClose", "prevClose"},
+                "Day's Range":       {"daysRange", "dayRange"},
+                "52-Week Range":     {"fiftyTwoWeekRange", "52WeekRange"},
+                "Beta":              {"beta"},
+                "Analysts":          {"analystRating", "analystRecommendation"},
+                "Price Target":      {"priceTarget", "targetMeanPrice"},
+                "Earnings Date":     {"earningsDate", "nextEarningsDate"},
+            }
+
+            for label, candidates in keymap.items():
+                val = _find_first_key(boot, candidates)
+                if isinstance(val, dict) and {"low", "high"} & set(val.keys()):
+                    val = _format_range(val.get("low"), val.get("high"))
+                elif label in {"Day's Range", "52-Week Range"} and isinstance(val, (list, tuple)) and len(val) >= 2:
+                    val = _format_range(val[0], val[1])
+                if val is not None:
+                    out[label] = _normalize_text(str(val))
+    except Exception:
+        pass
+
+    # --- B) ld+json fallbacks (sometimes sites mirror snapshot there) ---
+    if len(out) < len(CANONICAL_FIELDS):
+        for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                blob = json.loads(s.string or "")
+            except Exception:
+                continue
+            if not isinstance(blob, (dict, list)):
+                continue
+
+            def get_from_blob(label: str, candidates: set[str]):
+                val = _find_first_key(blob, candidates)
+                if isinstance(val, dict) and {"low", "high"} & set(val.keys()):
+                    val = _format_range(val.get("low"), val.get("high"))
+                elif label in {"Day's Range", "52-Week Range"} and isinstance(val, (list, tuple)) and len(val) >= 2:
+                    val = _format_range(val[0], val[1])
+                return val
+
+            # try a couple of useful fields
+            mapping = {
+                "Market Cap": {"marketCap"},
+                "Beta": {"beta"},
+            }
+            for lab, cands in mapping.items():
+                if lab not in out:
+                    v = get_from_blob(lab, cands)
+                    if v is not None:
+                        out[lab] = _normalize_text(str(v))
+
+    # --- C) DOM pairing by label text (class-agnostic) ---
+    if len(out) < len(CANONICAL_FIELDS):
+        for lab in CANONICAL_FIELDS:
+            if lab in out:
+                continue
+            val = _find_value_next_to_label(soup, lab)
+            if val:
+                out[lab] = val
+
+    # return only the canonical fields, in order
+    if not out:
         return None
+    return {k: out[k] for k in CANONICAL_FIELDS if k in out}
 
-    for item in snapshot_sections:
-        key = item.find("div", class_="snapshot__field")
-        val = item.find("div", class_="snapshot__data")
-        if key and val:
-            overview_dict[key.get_text(strip=True)] = val.get_text(strip=True)
+# =============================================================================
+# Public API
+# =============================================================================
+def get_company_data(ticker: str) -> Dict[str, object]:
+    session = make_session()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_overview = ex.submit(get_company_overview, ticker, session)
+        f_fin = ex.submit(fetch_financial_dfs, ticker, session)
+        overview = f_overview.result()
+        financials_dfs = f_fin.result()
+    financials_dict = dfs_to_latest(financials_dfs)
+    return {
+        "overview": overview,
+        "financials_dfs": financials_dfs,
+        "financials_dict": financials_dict,
+    }
 
-    return overview_dict
+# =============================================================================
+# Example
+# =============================================================================
+if __name__ == "__main__":
+    ticker = "NVDA"
+    data = get_company_data(ticker)
 
-sp500_df = get_data_table(sp500_url)
-ipos_df = get_data_table(ipos_url)
-ticker_list = list(sp500_df['Symbol'].values)
+    print("\n=== OVERVIEW (filtered) ===")
+    print(pd.Series(data["overview"]) if data["overview"] else "No overview found.")
 
-ticker = 'NVDA'
-company = {'ticker': ticker}
-company['financials'] = get_company_financials_as_df(ticker=company[ticker])
+    print("\n=== LATEST RATIOS ===")
+    for key in ["PE Ratio", "Forward PE", "Debt / Equity Ratio", "EPS (ttm)"]:
+        print(f"{key}: {data['financials_dict']['ratios'].get(key)}")
 
-
-dov_financials_df = get_company_financials_as_df(ticker='dov')
-dov_financials_df['ratios'][dov_financials_df['ratios']['Fiscal Year'] == 'Debt / Equity Ratio']['Current'].values[0]
-
-full_data_dict = get_full_data_from_table_dfs(dov_financials_df)
-
-
+    print("\n=== DATAFRAME SHAPES ===")
+    for k, df in data["financials_dfs"].items():
+        print(f"{k}: {None if df is None else df.shape}")
