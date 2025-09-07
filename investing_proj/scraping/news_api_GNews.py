@@ -117,7 +117,7 @@ def fetch_gnews(
     lang: str = "en",
     country: str = "us",
     days_back: int = 2,
-    max_results: int = 20,
+    max_results: int = 30,
     per_page: int = 10,
     search_in: str = "title,description",
     sortby: str = "publishedAt",

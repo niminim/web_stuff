@@ -181,9 +181,45 @@ def get_full_data_from_table_dfs(comp_df):
 
     return full_data_dict
 
+
+def get_company_overview(ticker):
+    """
+    Scrapes the overview table (Market Cap, PE Ratio, Dividend, etc.)
+    from the company's main stockanalysis.com page.
+    Returns a dictionary.
+    """
+    url = f"https://stockanalysis.com/stocks/{ticker}/"
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        print(f"Failed to fetch {ticker} overview. Status: {response.status_code}")
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    overview_dict = {}
+
+    # The overview table appears as multiple <div> elements with pairs of label + value
+    # Look for them inside "snapshot" sections
+    snapshot_sections = soup.find_all("div", class_="snapshot__data-item")
+    if not snapshot_sections:
+        print(f"No overview table found for {ticker}")
+        return None
+
+    for item in snapshot_sections:
+        key = item.find("div", class_="snapshot__field")
+        val = item.find("div", class_="snapshot__data")
+        if key and val:
+            overview_dict[key.get_text(strip=True)] = val.get_text(strip=True)
+
+    return overview_dict
+
 sp500_df = get_data_table(sp500_url)
 ipos_df = get_data_table(ipos_url)
 ticker_list = list(sp500_df['Symbol'].values)
+
+ticker = 'NVDA'
+company = {'ticker': ticker}
+company['financials'] = get_company_financials_as_df(ticker=company[ticker])
 
 
 dov_financials_df = get_company_financials_as_df(ticker='dov')
@@ -191,8 +227,4 @@ dov_financials_df['ratios'][dov_financials_df['ratios']['Fiscal Year'] == 'Debt 
 
 full_data_dict = get_full_data_from_table_dfs(dov_financials_df)
 
-
-# Changes:
-# added another row of categories (right under the first)
-# changes 'Year Ending' to 'Fiscal Year'
 

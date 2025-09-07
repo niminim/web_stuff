@@ -22,11 +22,8 @@ def print_all_data_from_ticker(ticker):
 
 
 # Example usage
-ticker = 'AAPL'
+ticker = 'NVDA'
 company_name = get_company_name_from_ticker(ticker)
 print(f"The company name for {ticker} is: {company_name}")
-
-
-# Example usage
-ticker = 'AAPL'
 print_all_data_from_ticker(ticker)
+

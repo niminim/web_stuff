@@ -54,5 +54,8 @@ plotly==5.22.0
 
 
 # Investing Project
+playwright==1.55.0
 feedparser==6.0.11
+newspaper3k==0.2.8
+trafilatura==2.0.0
 

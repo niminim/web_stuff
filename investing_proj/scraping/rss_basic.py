@@ -194,7 +194,7 @@ def fetch_company_news(
     country: str = "US",              # region bias
     days_back: Optional[int] = None,  # if provided, filter out items older than now - days_back
     dedupe: bool = True,              # de-dup by (title,url) after canonicalization
-    max_items: int = 100,             # unified cap for this provider
+    max_items: int = 30,             # unified cap for this provider
     max_results: Optional[int] = None # alias; if provided, overrides max_items
 ) -> Dict[str, object]:
     """
@@ -302,7 +302,7 @@ if __name__ == "__main__":
         country="US",  # region bias (default: "US")
         days_back=3,  # optional recency filter (None = no filter)
         dedupe=True,  # de-dup on (title, canonical_url) (default: True)
-        max_items=100,  # upper bound for this provider (default: 100)
+        max_items=50,  # upper bound for this provider (default: 100)
         # max_results=100,                 # alias; if set, it overrides max_items
     )
 

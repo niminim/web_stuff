@@ -321,8 +321,8 @@ def _parse_all_from_html(ticker: str, html: str, gf_hint: Optional[int] = None) 
         "financial_str": extract_rank_score(s, "Financial Strength", "rank-balancesheet"),
         "profit":        extract_rank_score(s, "Profitability Rank", "rank-profitability"),
         "growth":        extract_rank_score(s, "Growth Rank", "rank-growth"),
+        "momentum": extract_rank_score(s, "Momentum Rank", "rank-momentum"),
         "gf_value":      extract_rank_score(s, "GF Value Rank", "rank-gf-value"),
-        "momentum":      extract_rank_score(s, "Momentum Rank", "rank-momentum"),
         "GF_score":      "GF Score not found.",
     }
     if gf_hint is not None:
@@ -343,11 +343,11 @@ def _core_missing(main_scores: Dict[str, str]) -> bool:
         "Financial Strength score not found.",
         "Profitability Rank score not found.",
         "Growth Rank score not found.",
-        "GF Value Rank score not found.",
         "Momentum Rank score not found.",
+        "GF Value Rank score not found.",
     }
     gf_missing = (main_scores.get("GF_score") in not_found)
-    ranks = [main_scores.get(k, "") for k in ("financial_str", "profit", "growth", "gf_value", "momentum")]
+    ranks = [main_scores.get(k, "") for k in ("financial_str", "profit", "growth", "momentum", "gf_value")]
     ranks_missing = not any(re.match(r"^\d+\s*/\s*10$", r or "") for r in ranks)
     return gf_missing or ranks_missing
 
@@ -445,7 +445,9 @@ def get_financial_data_for_ticker(
 # =========================
 
 if __name__ == "__main__":
-    tickers: List[str] = ["SMR", "NVDA"]
+    tickers: List[str] = ["AAPL", "NVDA",  "GOOGL",  "MSFT",  "META", "AMZN"]
+    # tickers: List[str] = ["AAPL", "NVDA"]
+    # tickers: List[str] = ["QS", "RKLB", "CLOV", "SMR"]
 
     out_csv = "/home/nim/Downloads/gurufocus_scrapes.csv"
 
