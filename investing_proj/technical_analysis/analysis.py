@@ -1,7 +1,22 @@
-# analysis.py
+# technical_analysis/analysis.py
 """
-Lightweight logic to interpret indicators and fuse them into one verdict.
-Works on the ascending DataFrame produced by indicators.prepare_from_data().
+Lightweight technical analysis that fuses multiple signals into a single verdict,
+and produces a rich human-friendly summary.
+
+Inputs:
+    - ascending DataFrame (oldest → newest) with at least: Date, Open, High, Low, Close
+    - optional: Volume
+
+Outputs (analyze_all):
+    {
+      "parts": {
+         "bollinger": {...}, "rsi": {...}, "macd": {...},
+         "volume": {...}, "candles": {...}
+      },
+      "combined": {"score": float, "verdict": "bullish|bearish|neutral",
+                   "confidence": float, "reasons": str},
+      "summary": { headline, bullets, levels, metrics, risk_box, regime }
+    }
 """
 
 from __future__ import annotations
@@ -9,34 +24,52 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# ----------------------------- helpers --------------------------------------
+# Candlestick patterns (make sure the file exists: technical_analysis/candlestick_patterns.py)
+from technical_analysis.candlestick_patterns import analyze_candles
+
+
+# =============================================================================
+# Utilities & feature builders
+# =============================================================================
 def _safe_last_two(s: pd.Series) -> tuple[float, float]:
     if len(s) >= 2:
         return float(s.iloc[-2]), float(s.iloc[-1])
     v = float(s.iloc[-1])
     return v, v
 
+
 def _ensure_volume_features(df: pd.DataFrame) -> None:
     """Add VOL_Z, OBV, OBV_SLOPE if Volume exists (idempotent)."""
-    if "Volume" not in df.columns or "VOL_Z" in df.columns:
+    if "Volume" not in df.columns:
         return
+    if "VOL_Z" in df.columns and "OBV" in df.columns and "OBV_SLOPE" in df.columns:
+        return
+
     v = df["Volume"].astype(float)
     mu = v.rolling(20, min_periods=20).mean()
     sd = v.rolling(20, min_periods=20).std(ddof=0)
-    df["VOL_Z"] = (v - mu) / (sd + 1e-9)
+    if "VOL_Z" not in df.columns:
+        df["VOL_Z"] = (v - mu) / (sd + 1e-9)
 
     delta = df["Close"].astype(float).diff().fillna(0.0)
     obv = (np.sign(delta).replace({0: np.nan}).fillna(0) * v).cumsum()
-    df["OBV"] = obv
-    df["OBV_SLOPE"] = df["OBV"].diff(14)
+    if "OBV" not in df.columns:
+        df["OBV"] = obv
+    if "OBV_SLOPE" not in df.columns:
+        df["OBV_SLOPE"] = df["OBV"].diff(14)
 
-# === NEW: regime, levels, ATR, slopes =======================================
+
 def _ensure_regime_features(df: pd.DataFrame) -> None:
     """
     Adds:
-      SMA50, SMA200, ATR14, trend slope (Close EMA20 slope), 20D high/low + proximity,
-      daily return stats (20D).
+      SMA50, SMA200, ATR14, EMA20, EMA20_SLOPE,
+      HH20, LL20, proximity to these in %, 20D return stats.
+    Idempotent; only computes if missing.
     """
+    for col in ("Close", "High", "Low"):
+        if col not in df.columns:
+            raise ValueError(f"DataFrame missing required column: {col}")
+
     close = df["Close"].astype(float)
     high  = df["High"].astype(float)
     low   = df["Low"].astype(float)
@@ -46,7 +79,16 @@ def _ensure_regime_features(df: pd.DataFrame) -> None:
     if "SMA200" not in df.columns:
         df["SMA200"] = close.rolling(200, min_periods=200).mean()
 
-    # ATR(14)
+    if "EMA20" not in df.columns:
+        df["EMA20"] = close.ewm(span=20, adjust=False).mean()
+    if "EMA20_SLOPE" not in df.columns:
+        df["EMA20_SLOPE"] = df["EMA20"].diff()
+
+    if "HH20" not in df.columns:
+        df["HH20"] = close.rolling(20, min_periods=20).max()
+    if "LL20" not in df.columns:
+        df["LL20"] = close.rolling(20, min_periods=20).min()
+
     if "ATR14" not in df.columns:
         prev_close = close.shift(1)
         tr = pd.concat([
@@ -56,35 +98,25 @@ def _ensure_regime_features(df: pd.DataFrame) -> None:
         ], axis=1).max(axis=1)
         df["ATR14"] = tr.rolling(14, min_periods=14).mean()
 
-    # Trend slope via EMA20 derivative (units: price/day)
-    if "EMA20" not in df.columns:
-        df["EMA20"] = close.ewm(span=20, adjust=False).mean()
-    df["EMA20_SLOPE"] = df["EMA20"].diff()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        df["PROX_HH20_PCT"] = (close / df["HH20"] - 1.0) * 100.0
+        df["PROX_LL20_PCT"] = (close / df["LL20"] - 1.0) * 100.0
 
-    # 20D breakout levels + proximity
-    if "HH20" not in df.columns:
-        df["HH20"] = close.rolling(20, min_periods=20).max()
-        df["LL20"] = close.rolling(20, min_periods=20).min()
-    last_close = float(close.iloc[-1])
-    last_hh20  = float(df["HH20"].iloc[-1]) if not np.isnan(df["HH20"].iloc[-1]) else np.nan
-    last_ll20  = float(df["LL20"].iloc[-1]) if not np.isnan(df["LL20"].iloc[-1]) else np.nan
-
-    # proximity in %
-    df["PROX_HH20_PCT"] = (close / df["HH20"] - 1.0) * 100.0
-    df["PROX_LL20_PCT"] = (close / df["LL20"] - 1.0) * 100.0
-
-    # Return stats
     ret = close.pct_change()
-    df["RET20_MEAN"] = ret.rolling(20, min_periods=5).mean()
-    df["RET20_STD"]  = ret.rolling(20, min_periods=5).std(ddof=0)
+    if "RET20_MEAN" not in df.columns:
+        df["RET20_MEAN"] = ret.rolling(20, min_periods=5).mean()
+    if "RET20_STD" not in df.columns:
+        df["RET20_STD"]  = ret.rolling(20, min_periods=5).std(ddof=0)
 
-# --------------------------- per-indicator -----------------------------------
+
+# =============================================================================
+# Per-indicator analyses
+# =============================================================================
 def analyze_bollinger(df: pd.DataFrame) -> dict:
-    req = {"Close","BB_UPPER","BB_MIDDLE","BB_LOWER","BB_BANDWIDTH"}
+    req = {"Close", "BB_UPPER", "BB_MIDDLE", "BB_LOWER", "BB_BANDWIDTH"}
     if not req.issubset(df.columns):
-        return {"name":"bollinger","score":0.0,"short_note":"BB: n/a","note":"Missing columns."}
+        return {"name": "bollinger", "score": 0.0, "short_note": "BB: n/a", "note": "Missing columns."}
 
-    # Squeeze via bandwidth percentile over last ~1y
     bw = df["BB_BANDWIDTH"].iloc[-252:] if len(df) >= 20 else df["BB_BANDWIDTH"]
     bw_rank = bw.rank(pct=True).iloc[-1] if bw.notna().any() else np.nan
     squeeze = bool(bw_rank <= 0.15) if np.isfinite(bw_rank) else False
@@ -110,16 +142,24 @@ def analyze_bollinger(df: pd.DataFrame) -> dict:
     short += " cross↓;" if cross_dn else ""
     short += " squeeze" if squeeze else ""
 
-    note = f"Price={last_c:.2f}, Mid={mid_last:.2f}, Up={up:.2f}, Low={lo:.2f}. " \
-           f"{'Low-vol squeeze. ' if squeeze else ''}".strip()
+    note = f"Price={last_c:.2f}, Mid={mid_last:.2f}, Up={up:.2f}, Low={lo:.2f}. "
+    if squeeze:
+        note += "Low-volatility squeeze. "
 
-    return {"name":"bollinger","score":score,"short_note":short.strip("; "),
-            "note":note, "signals":{"touch_upper":touch_up,"touch_lower":touch_lo,
-                                    "cross_up":cross_up,"cross_dn":cross_dn,"squeeze":squeeze}}
+    return {
+        "name": "bollinger", "score": score,
+        "short_note": short.strip("; "), "note": note.strip(),
+        "signals": {
+            "touch_upper": touch_up, "touch_lower": touch_lo,
+            "cross_up": cross_up, "cross_dn": cross_dn, "squeeze": squeeze
+        }
+    }
+
 
 def analyze_rsi(df: pd.DataFrame) -> dict:
     if "RSI" not in df.columns:
-        return {"name":"rsi","score":0.0,"short_note":"RSI: n/a","note":"Missing RSI."}
+        return {"name": "rsi", "score": 0.0, "short_note": "RSI: n/a", "note": "Missing RSI."}
+
     prev, last = _safe_last_two(df["RSI"])
     overbought = last >= 70
     oversold   = last <= 30
@@ -135,20 +175,24 @@ def analyze_rsi(df: pd.DataFrame) -> dict:
     short += " ↑turn" if turning_up else ""
     short += " ↓turn" if turning_dn else ""
 
-    note = f"RSI={last:.1f}. " \
-           f"{'Overbought. ' if overbought else ''}" \
-           f"{'Oversold. ' if oversold else ''}" \
-           f"{'Turning up from OS. ' if turning_up else ''}" \
-           f"{'Turning down from OB. ' if turning_dn else ''}".strip()
+    note = f"RSI={last:.1f}. "
+    if overbought: note += "Overbought. "
+    if oversold:   note += "Oversold. "
+    if turning_up: note += "Turning up from OS. "
+    if turning_dn: note += "Turning down from OB. "
 
-    return {"name":"rsi","score":score,"short_note":short,"note":note,
-            "signals":{"overbought":overbought,"oversold":oversold,
-                       "turning_up":turning_up,"turning_dn":turning_dn}}
+    return {
+        "name": "rsi", "score": score, "short_note": short.strip(), "note": note.strip(),
+        "signals": {"overbought": overbought, "oversold": oversold,
+                    "turning_up": turning_up, "turning_dn": turning_dn}
+    }
+
 
 def analyze_macd(df: pd.DataFrame) -> dict:
-    req = {"MACD","MACD_SIGNAL","MACD_HIST"}
+    req = {"MACD", "MACD_SIGNAL", "MACD_HIST"}
     if not req.issubset(df.columns):
-        return {"name":"macd","score":0.0,"short_note":"MACD: n/a","note":"Missing MACD."}
+        return {"name": "macd", "score": 0.0, "short_note": "MACD: n/a", "note": "Missing MACD."}
+
     prev_m, m = _safe_last_two(df["MACD"])
     prev_s, s = _safe_last_two(df["MACD_SIGNAL"])
     prev_h, h = _safe_last_two(df["MACD_HIST"])
@@ -165,21 +209,25 @@ def analyze_macd(df: pd.DataFrame) -> dict:
     short += " bearX;" if bear_x else ""
     short += " hist↑" if hist_up else " hist↓"
 
-    note = f"MACD={m:.2f}, Signal={s:.2f}, Hist={h:.2f}. " \
-           f"{'Bullish crossover. ' if bull_x else ''}" \
-           f"{'Bearish crossover. ' if bear_x else ''}" \
-           f"{'Momentum increasing.' if hist_up else 'Momentum fading.'}"
+    note = f"MACD={m:.2f}, Signal={s:.2f}, Hist={h:.2f}. "
+    if bull_x: note += "Bullish crossover. "
+    if bear_x: note += "Bearish crossover. "
+    note += "Momentum increasing." if hist_up else "Momentum fading."
 
-    return {"name":"macd","score":score,"short_note":short.strip('; '),"note":note,
-            "signals":{"bull_cross":bull_x,"bear_cross":bear_x,"hist_growing":hist_up}}
+    return {
+        "name": "macd", "score": score, "short_note": short.strip("; "), "note": note.strip(),
+        "signals": {"bull_cross": bull_x, "bear_cross": bear_x, "hist_growing": hist_up}
+    }
+
 
 def analyze_volume(df: pd.DataFrame) -> dict:
     if "Volume" not in df.columns:
-        return {"name":"volume","score":0.0,"short_note":"VOL: n/a","note":"No volume."}
+        return {"name": "volume", "score": 0.0, "short_note": "VOL: n/a", "note": "No volume."}
+
     _ensure_volume_features(df)
     prev_c, last_c = _safe_last_two(df["Close"])
-    vz = float(df["VOL_Z"].iloc[-1]) if "VOL_Z" in df.columns else np.nan
-    obv_slope = float(df["OBV_SLOPE"].iloc[-1]) if "OBV_SLOPE" in df.columns else 0.0
+    vz = float(df.get("VOL_Z", pd.Series([np.nan])).iloc[-1])
+    obv_slope = float(df.get("OBV_SLOPE", pd.Series([0.0])).iloc[-1])
 
     price_up = last_c > prev_c
     obv_up = obv_slope > 0
@@ -190,74 +238,80 @@ def analyze_volume(df: pd.DataFrame) -> dict:
 
     short = f"VOL:z={vz:.2f}" if np.isfinite(vz) else "VOL:n/a"
     short += " +OBV" if obv_up else " -OBV"
-    note = f"Volume z-score={vz:.2f}. " \
-           f"{'OBV rising. ' if obv_up else 'OBV falling. '}" \
-           f"{'Unusually high volume. ' if np.isfinite(vz) and vz>2 else ''}" \
-           f"{'Unusually low volume. ' if np.isfinite(vz) and vz<-2 else ''}".strip()
 
-    return {"name":"volume","score":score,"short_note":short,"note":note,
-            "signals":{"price_up":price_up,"obv_up":obv_up,"vz":vz}}
+    note = f"Volume z-score={vz:.2f}. "
+    note += "OBV rising. " if obv_up else "OBV falling. "
+    if np.isfinite(vz) and vz > 2:  note += "Unusually high volume. "
+    if np.isfinite(vz) and vz < -2: note += "Unusually low volume. "
 
-# === NEW: simple divergence detection (efficient) ============================
-def _last_swing(series: pd.Series, lookback: int = 20, mode: str = "high") -> Tuple[int, float]:
-    """
-    Find index of last swing high/low in last `lookback` bars.
-    mode: 'high' -> argmax, 'low' -> argmin.
-    Returns (idx, value) in absolute df index coordinates; if NA, returns (-1, nan).
-    """
+    return {
+        "name": "volume", "score": score, "short_note": short, "note": note.strip(),
+        "signals": {"price_up": price_up, "obv_up": obv_up, "vz": vz}
+    }
+
+
+# =============================================================================
+# Simple divergence detection (optional context)
+# =============================================================================
+def _last_swing(series: pd.Series, lookback: int = 30, mode: str = "high") -> Tuple[int, float]:
+    """Return (index, value) of last swing high/low within lookback; -1, nan if none."""
     window = series.iloc[-lookback:]
     if window.empty or window.isna().all():
         return -1, np.nan
-    pos = int(window.values.argmax()) if mode == "high" else int(window.values.argmin())
-    val = float(window.iloc[pos])
-    return (series.index[-lookback + pos], val)
+    if mode == "high":
+        pos = int(np.nanargmax(window.values))
+        val = float(window.iloc[pos])
+        return (series.index[-lookback + pos], val)
+    else:
+        pos = int(np.nanargmin(window.values))
+        val = float(window.iloc[pos])
+        return (series.index[-lookback + pos], val)
+
 
 def analyze_divergence(df: pd.DataFrame) -> dict:
-    """
-    Basic divergence: compare direction of price vs RSI/MACD around recent swings.
-    - Bearish div: price higher high, oscillator lower high.
-    - Bullish div: price lower low, oscillator higher low.
-    """
     if "RSI" not in df.columns or "MACD" not in df.columns:
-        return {"name":"divergence","note":"Not enough data.","signals":{}}
+        return {"name": "divergence", "note": "Not enough data.", "signals": {}}
 
-    # last swing highs/lows over 30 bars
     look = min(len(df), 30)
     if look < 10:
-        return {"name":"divergence","note":"Insufficient history.","signals":{}}
+        return {"name": "divergence", "note": "Insufficient history.", "signals": {}}
 
-    # indices and values
     i_h, p_h = _last_swing(df["Close"], look, "high")
     i_l, p_l = _last_swing(df["Close"], look, "low")
-
     i_hrsi, rsi_h = _last_swing(df["RSI"], look, "high")
     i_lrsi, rsi_l = _last_swing(df["RSI"], look, "low")
-
     i_hmacd, m_h = _last_swing(df["MACD"], look, "high")
     i_lmacd, m_l = _last_swing(df["MACD"], look, "low")
 
-    bear_rsi = (i_h != -1 and i_hrsi != -1) and (p_h >= df["Close"].iloc[-1]) and (rsi_h < df["RSI"].iloc[-1])
-    bull_rsi = (i_l != -1 and i_lrsi != -1) and (p_l <= df["Close"].iloc[-1]) and (rsi_l > df["RSI"].iloc[-1])
+    bear_rsi = (i_h != -1 and i_hrsi != -1) and (rsi_h < df["RSI"].iloc[-1]) and (p_h >= df["Close"].iloc[-1])
+    bull_rsi = (i_l != -1 and i_lrsi != -1) and (rsi_l > df["RSI"].iloc[-1]) and (p_l <= df["Close"].iloc[-1])
 
-    bear_macd = (i_h != -1 and i_hmacd != -1) and (p_h >= df["Close"].iloc[-1]) and (m_h < df["MACD"].iloc[-1])
-    bull_macd = (i_l != -1 and i_lmacd != -1) and (p_l <= df["Close"].iloc[-1]) and (m_l > df["MACD"].iloc[-1])
+    bear_macd = (i_h != -1 and i_hmacd != -1) and (m_h < df["MACD"].iloc[-1]) and (p_h >= df["Close"].iloc[-1])
+    bull_macd = (i_l != -1 and i_lmacd != -1) and (m_l > df["MACD"].iloc[-1]) and (p_l <= df["Close"].iloc[-1])
 
     note = []
     if bear_rsi or bear_macd: note.append("Potential bearish divergence.")
     if bull_rsi or bull_macd: note.append("Potential bullish divergence.")
     if not note: note.append("No clear divergence.")
 
-    return {"name":"divergence","note":" ".join(note),
-            "signals":{"bear_rsi":bear_rsi,"bull_rsi":bull_rsi,"bear_macd":bear_macd,"bull_macd":bull_macd}}
+    return {
+        "name": "divergence", "note": " ".join(note),
+        "signals": {"bear_rsi": bear_rsi, "bull_rsi": bull_rsi,
+                    "bear_macd": bear_macd, "bull_macd": bull_macd}
+    }
 
-# ------------------------------ fusion ---------------------------------------
+
+# =============================================================================
+# Fusion & summary
+# =============================================================================
 def combine(parts: Dict[str, dict], weights: Optional[dict] = None) -> dict:
     """
     Fuse scores into a single verdict.
-    Default weights: BB/MACD (trend) > RSI (momentum) > Volume (confirmation).
+    Default weights prioritize trend/momentum (BB/MACD) with candles + volume confirmation.
     """
     if weights is None:
-        weights = {"bollinger":0.30, "macd":0.30, "rsi":0.25, "volume":0.15}
+        # NOTE: includes 'candles' in the fusion
+        weights = {"bollinger": 0.27, "macd": 0.27, "rsi": 0.21, "candles": 0.15, "volume": 0.10}
 
     total, wsum = 0.0, 0.0
     reasons = []
@@ -271,38 +325,27 @@ def combine(parts: Dict[str, dict], weights: Optional[dict] = None) -> dict:
     score = total / max(wsum, 1e-9)
     verdict = "bullish" if score >= 0.30 else ("bearish" if score <= -0.30 else "neutral")
     sign = np.sign(score)
-    agree = sum(1 for r in parts.values() if np.sign(r.get("score",0.0)) == sign and r.get("score",0.0) != 0)
+    agree = sum(1 for r in parts.values() if np.sign(r.get("score", 0.0)) == sign and r.get("score", 0.0) != 0)
     confidence = agree / max(len(parts), 1)
 
-    return {"score":score, "verdict":verdict, "confidence":float(confidence), "reasons":"; ".join(reasons)}
+    return {"score": float(score), "verdict": verdict,
+            "confidence": float(confidence), "reasons": "; ".join(reasons)}
 
-# === NEW: headline + rich summary ===========================================
+
 def _headline(verdict: str, score: float, regime: dict) -> str:
-    """Compose a short headline string."""
     bias = []
-    if regime.get("above_200dma"): bias.append("above 200DMA")
-    else: bias.append("below 200DMA")
-    if regime.get("above_50dma"): bias.append("above 50DMA")
+    bias.append("above 200DMA" if regime.get("above_200dma") else "below 200DMA")
+    bias.append("above 50DMA"  if regime.get("above_50dma")  else "below 50DMA")
     slope = regime.get("ema20_slope", 0.0)
     if slope > 0: bias.append("short-term slope ↑")
     elif slope < 0: bias.append("short-term slope ↓")
-    return f"{verdict.upper()} (score {score:+.2f}) — " + ", ".join(bias)
+    atr_pct = regime.get("atr_pct")
+    atr_txt = f", ATR≈{regime.get('atr_val', 'n/a')} (~{round(atr_pct*100,2)}% of price)" if isinstance(atr_pct, float) else ""
+    return f"{verdict.upper()} (score {score:+.2f}) — " + ", ".join(bias) + atr_txt
 
-def _format_pct(x: float) -> str:
-    try:
-        return f"{x*100:.2f}%"
-    except Exception:
-        return "n/a"
 
-def build_rich_summary(df: pd.DataFrame, parts: Dict[str,dict], combined: dict) -> dict:
-    """
-    Build a human-friendly pack:
-      - headline
-      - bullets (key reasons)
-      - levels (20D high/low proximity)
-      - metrics (ATR%, ret mean/std)
-      - risk box (non-advice): example stop/target bands via ATR
-    """
+def build_rich_summary(df: pd.DataFrame, parts: Dict[str, dict], combined: dict) -> dict:
+    """Create a friendly summary including regime, levels, metrics, and an ATR-based risk box."""
     _ensure_regime_features(df)
     last = df.iloc[-1]
     close = float(last["Close"])
@@ -311,44 +354,34 @@ def build_rich_summary(df: pd.DataFrame, parts: Dict[str,dict], combined: dict) 
     atr    = float(last.get("ATR14", np.nan))
     ema20_slope = float(last.get("EMA20_SLOPE", 0.0))
 
-    above_50 = np.isfinite(sma50)  and close >= sma50
-    above_200= np.isfinite(sma200) and close >= sma200
-    atr_pct  = atr / close if (np.isfinite(atr) and atr>0) else np.nan
+    above_50  = np.isfinite(sma50)  and close >= sma50
+    above_200 = np.isfinite(sma200) and close >= sma200
+    atr_pct   = (atr / close) if (np.isfinite(atr) and atr > 0 and close != 0) else np.nan
 
     hh20 = float(last.get("HH20", np.nan))
     ll20 = float(last.get("LL20", np.nan))
     prox_hh = float(last.get("PROX_HH20_PCT", np.nan))
     prox_ll = float(last.get("PROX_LL20_PCT", np.nan))
 
-    regime = {
-        "above_50dma": bool(above_50),
-        "above_200dma": bool(above_200),
-        "ema20_slope": ema20_slope,
-        "atr_pct": atr_pct,
-    }
+    regime = {"above_50dma": bool(above_50), "above_200dma": bool(above_200),
+              "ema20_slope": ema20_slope, "atr_pct": atr_pct, "atr_val": None if not np.isfinite(atr) else round(atr,2)}
 
-    # bullets from parts
     bullets = []
-    bullets.append(parts["bollinger"]["short_note"])
-    bullets.append(parts["macd"]["short_note"])
-    bullets.append(parts["rsi"]["short_note"])
-    if "volume" in parts: bullets.append(parts["volume"]["short_note"])
+    for k in ("bollinger", "macd", "rsi", "volume", "candles"):
+        if k in parts and parts[k].get("short_note"):
+            bullets.append(parts[k]["short_note"])
 
-    # divergences
+    # Divergence (contextual)
     div = analyze_divergence(df)
-    if "divergence" not in parts:
-        parts["divergence"] = div
-    if div["signals"]:
-        if any(div["signals"].values()):
-            bullets.append(div["note"])
+    if any(div.get("signals", {}).values()):
+        bullets.append(div["note"])
 
-    # risk box (illustrative only, not advice)
     risk = {}
     if np.isfinite(atr) and atr > 0:
         risk = {
-            "illustrative_stop": round(close - 1.5*atr, 2),
-            "illustrative_target": round(close + 2.0*atr, 2),
-            "atr_pct": None if np.isnan(atr_pct) else round(atr_pct*100, 2)
+            "illustrative_stop": round(close - 1.5 * atr, 2),
+            "illustrative_target": round(close + 2.0 * atr, 2),
+            "atr_pct": None if np.isnan(atr_pct) else round(atr_pct, 4)
         }
 
     metrics = {
@@ -356,9 +389,9 @@ def build_rich_summary(df: pd.DataFrame, parts: Dict[str,dict], combined: dict) 
         "sma50": None if not np.isfinite(sma50) else round(sma50, 2),
         "sma200": None if not np.isfinite(sma200) else round(sma200, 2),
         "atr14": None if not np.isfinite(atr) else round(atr, 2),
-        "atr_as_pct": None if np.isnan(atr_pct) else round(atr_pct*100, 2),
-        "ret20_mean_pct": None if not np.isfinite(float(last.get("RET20_MEAN", np.nan))) else round(float(last["RET20_MEAN"])*100, 2),
-        "ret20_std_pct":  None if not np.isfinite(float(last.get("RET20_STD", np.nan)))  else round(float(last["RET20_STD"])*100, 2),
+        "atr_as_pct": None if np.isnan(atr_pct) else round(atr_pct * 100, 2),
+        "ret20_mean_pct": None if not np.isfinite(float(last.get("RET20_MEAN", np.nan))) else round(float(last["RET20_MEAN"]) * 100, 2),
+        "ret20_std_pct":  None if not np.isfinite(float(last.get("RET20_STD", np.nan)))  else round(float(last["RET20_STD"]) * 100, 2),
     }
 
     levels = {
@@ -370,24 +403,30 @@ def build_rich_summary(df: pd.DataFrame, parts: Dict[str,dict], combined: dict) 
 
     headline = _headline(combined["verdict"], combined["score"], regime)
 
-    return {
-        "headline": headline,
-        "bullets": bullets,
-        "levels": levels,
-        "metrics": metrics,
-        "risk_box": risk,
-        "regime": regime
-    }
+    return {"headline": headline, "bullets": bullets, "levels": levels,
+            "metrics": metrics, "risk_box": risk, "regime": regime}
 
-# ------------------------------ public API -----------------------------------
+
+# =============================================================================
+# Public API
+# =============================================================================
 def analyze_all(df_asc: pd.DataFrame) -> dict:
-    """Run all per-indicator analyses + fusion on the ascending DF, with rich summary."""
-    _ensure_regime_features(df_asc)  # ensures ATR/DMAs/levels exist for summary
-    bb = analyze_bollinger(df_asc)
-    rsi = analyze_rsi(df_asc)
+    """
+    Run all per-indicator analyses + fusion on the ascending DF, with rich summary.
+    Includes candlestick pattern analysis.
+    """
+    # Ensure regime/volume features available for downstream
+    _ensure_regime_features(df_asc)
+    _ensure_volume_features(df_asc)
+
+    bb   = analyze_bollinger(df_asc)
+    rsi  = analyze_rsi(df_asc)
     macd = analyze_macd(df_asc)
-    vol = analyze_volume(df_asc)
-    parts = {"bollinger": bb, "rsi": rsi, "macd": macd, "volume": vol}
-    fused = combine(parts)
+    vol  = analyze_volume(df_asc)
+    candles = analyze_candles(df_asc)  # <-- NEW: candlesticks in parts
+
+    parts = {"bollinger": bb, "rsi": rsi, "macd": macd, "volume": vol, "candles": candles}
+    fused = combine(parts)                   # <-- candles weighted in fusion
     summary = build_rich_summary(df_asc, parts, fused)
+
     return {"parts": parts, "combined": fused, "summary": summary}
