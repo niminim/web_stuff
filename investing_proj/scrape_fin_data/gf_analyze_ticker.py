@@ -18,6 +18,7 @@ python -m playwright install
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -447,9 +448,12 @@ def get_financial_data_for_ticker(
 if __name__ == "__main__":
     tickers: List[str] = ["AAPL", "NVDA",  "GOOGL",  "MSFT",  "META", "AMZN"]
     # tickers: List[str] = ["AAPL", "NVDA"]
-    # tickers: List[str] = ["QS", "RKLB", "CLOV", "SMR"]
+    tickers: List[str] = ["QS", "RKLB", "CLOV", "SMR"]
+    tickers: List[str] = ["CRSR"]
 
     out_csv = "/home/nim/Downloads/gurufocus_scrapes.csv"
+    jsons_dir = "/home/nim/Downloads/GF_companies"
+    os.makedirs(jsons_dir, exist_ok=True)
 
     # Scrape tickers (no per-ticker prints here)
     out: List[TickerResult] = scrape_tickers(tickers, max_workers=8, headless=True)
@@ -460,7 +464,7 @@ if __name__ == "__main__":
         # no printing here
         df_row = dicts_to_df(item.ticker, item.main_scores, item.other_data)
         all_rows.append(df_row)
-        save_scores_json(f"{item.ticker}_scores.json", item.ticker, item.main_scores)
+        save_scores_json(f"{jsons_dir}/{item.ticker}_scores.json", item.ticker, item.main_scores)
 
     # ✅ Keep the combined preview print
     if all_rows:
@@ -480,5 +484,5 @@ if __name__ == "__main__":
 
 # no specific need for using this wrapper, could use scrape_tickers only.
 # this one is just more straight-forward
-ticker = 'NVDA'
+ticker = 'CRSR'
 main_scores, other_indicators = get_financial_data_for_ticker(ticker, print_all_data=True)
