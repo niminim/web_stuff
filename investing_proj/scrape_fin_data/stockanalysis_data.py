@@ -505,20 +505,13 @@ def _parse_simple_table(tbl: Tag) -> pd.DataFrame:
 
 def get_forecast_stock(ticker: str, session: requests.Session) -> Optional[dict]:
     """
-    Returns (when any present):
+    Returns when present:
       {
-        'price_targets_table': {           # the two-row table with Price / Change
+        'price_targets_table': {  # two-row table with Price / Change
             'Price': {'Low':..., 'Average':..., 'Median':..., 'High':...},
             'Change': {'Low':..., 'Average':..., 'Median':..., 'High':...}
         },
-        'price_targets_current': {         # optional small summary with 'Current' + columns
-            'Current': <str> or None,
-            'Low': <str> or None,
-            'Average': <str> or None,
-            'Median': <str> or None,
-            'High': <str> or None
-        },
-        'ratings_trend_df': pd.DataFrame   # table with rows: Strong Buy/Buy/Hold/Sell/Strong Sell/Total
+        'ratings_trend_df': pd.DataFrame  # rows: Strong Buy/Buy/Hold/Sell/Strong Sell/Total
       }
     """
     url = f"{BASE}/stocks/{ticker.lower().strip()}/forecast/"
@@ -528,40 +521,53 @@ def get_forecast_stock(ticker: str, session: requests.Session) -> Optional[dict]
     if not tables:
         return None
 
-    price_table_dict = None
-    price_current_dict = None
-    ratings_df = None
+    def _parse_simple_table(tbl: Tag) -> pd.DataFrame:
+        headers = [th.get_text(strip=True) for th in tbl.find_all("th")]
+        if not headers:
+            first_tr = tbl.find("tr")
+            headers = [td.get_text(strip=True) for td in (first_tr.find_all("td") if first_tr else [])]
+        rows = []
+        for tr in tbl.find_all("tr"):
+            cells = [c.get_text(strip=True) for c in tr.find_all(["th","td"])]
+            if cells and cells != headers:
+                rows.append(cells)
+        n = len(headers) if headers else max((len(r) for r in rows), default=0)
+        rows = [(r + [""]*(n-len(r)))[:n] for r in rows]
+        if not headers:
+            headers = [f"C{i+1}" for i in range(n)]
+        return pd.DataFrame(rows, columns=headers)
 
-    # helpers
-    def has_cols(cols: List[str], ths_lower: List[str]) -> bool:
+    def has_cols(cols, ths_lower):
         s = set(ths_lower)
         return all(c.lower() in s for c in cols)
 
     month_like = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+'?\d{2}$", re.I)
+
+    price_table_dict = None
+    ratings_df = None
 
     for tbl in tables:
         ths = [t.get_text(strip=True) for t in tbl.find_all("th")]
         ths_lower = [t.lower() for t in ths]
 
         # Ratings trend table
-        if ths and _normalize_text(ths[0]).lower() in {"rating", "ratings"} and any(month_like.match(h) for h in ths[1:]):
-            ratings_df = _parse_simple_table(tbl)
-            ratings_df.rename(columns={ratings_df.columns[0]: "Rating"}, inplace=True)
+        if ths and (ths[0].strip().lower() in {"rating","ratings"}) and any(month_like.match(h) for h in ths[1:]):
+            df = _parse_simple_table(tbl)
+            df.rename(columns={df.columns[0]: "Rating"}, inplace=True)
+            ratings_df = df
             continue
 
-        # Price/Change table (Target | Low | Average | Median | High) with rows Price/Change
-        if ths and ("target" in ths_lower[0]) and has_cols(["low", "average", "median", "high"], ths_lower):
+        # Price/Change table: "Target | Low | Average | Median | High"
+        if ths and ("target" in ths_lower[0]) and has_cols(["low","average","median","high"], ths_lower):
             df = _parse_simple_table(tbl)
-            first_col = df.columns[0]  # "Target"
-            # Build dict keyed by row labels
-            row_map: dict[str, dict] = {}
+            first_col = df.columns[0]
+            row_map = {}
             for _, row in df.iterrows():
-                label = _normalize_text(str(row[first_col])).lower()
+                label = _normalize_text(str(row[first_col])).lower()  # "price" / "change"
                 per_col = {}
                 for c in df.columns[1:]:
                     per_col[_normalize_text(c).capitalize()] = _normalize_text(str(row[c]))
                 row_map[label] = per_col
-            # Extract canonical rows if present
             out = {}
             if "price" in row_map:
                 out["Price"] = row_map["price"]
@@ -571,35 +577,12 @@ def get_forecast_stock(ticker: str, session: requests.Session) -> Optional[dict]
                 price_table_dict = out
             continue
 
-        # Current-vs-targets summary: headers Low/Average/Median/High (and sometimes 'Current')
-        if ths and has_cols(["low", "average", "median", "high"], ths_lower) and ("target" not in ths_lower[0]) and (_normalize_text(ths[0]).lower() not in {"rating", "ratings"}):
-            df = _parse_simple_table(tbl)
-            # This block often has only one data row (e.g., 'Current') or no row label.
-            # We'll collect by header names.
-            cur = {k.capitalize(): None for k in ["Current", "Low", "Average", "Median", "High"]}
-            # If there is a 'Current' header, great. Otherwise, try first column as row label.
-            col_map = { _normalize_text(c).capitalize(): c for c in df.columns }
-            # Row-wise attempt: take the first row
-            if not df.empty:
-                first_row = df.iloc[0]
-                # If table includes 'Current' as a header
-                for want in ["Current", "Low", "Average", "Median", "High"]:
-                    if want in col_map:
-                        cur[want] = _normalize_text(str(first_row[col_map[want]]))
-                # If 'Current' wasn't in headers, but first column looks like 'Current'
-                if cur["Current"] in (None, ""):
-                    # assume first cell (of first row) is the 'Current' value or label
-                    cur["Current"] = _normalize_text(str(first_row.iloc[0]))
-            price_current_dict = cur
-            continue
-
-    if price_table_dict is None and ratings_df is None and price_current_dict is None:
+    if price_table_dict is None and ratings_df is None:
         return None
 
     return {
         "price_targets_table": price_table_dict or {},
-        "price_targets_current": price_current_dict or {},
-        "ratings_trend_df": ratings_df,  # may be None if not found
+        "ratings_trend_df": ratings_df,
     }
 
 # =============================================================================
@@ -853,8 +836,6 @@ if __name__ == "__main__":
     print("\n=== FORECAST (stock) ===")
     fc = data.get("forecast", {})
     print("Price targets table:", fc.get("price_targets_table"))
-    pct = fc.get("price_targets_current")
-    print("Price targets current:", pct if pct else "{}")
     rtdf = fc.get("ratings_trend_df")
     if isinstance(rtdf, pd.DataFrame):
         print("Ratings trend (head):")

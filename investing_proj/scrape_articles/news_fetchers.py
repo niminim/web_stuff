@@ -27,17 +27,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Iterable, Tuple
 
 
-import os
-import sys
+# project_root = os.path.abspath("/investing_proj/scrape_articles")
+# sys.path.append(project_root)
+# print(sys.path)
+#
+# # Import your existing provider modules
+# from news_api_GNews import fetch_gnews as _fetch_gnews
+# from newsapi import fetch_newsapi as _fetch_newsapi
+# from rss_basic import fetch_company_news as _fetch_rss
 
-project_root = os.path.abspath("/investing_proj/scrape_articles")
-sys.path.append(project_root)
-print(sys.path)
 
-# Import your existing provider modules
-from news_api_GNews import fetch_gnews as _fetch_gnews
-from newsapi import fetch_newsapi as _fetch_newsapi
-from rss_basic import fetch_company_news as _fetch_rss
+# ❌ remove:
+# import os, sys
+# project_root = os.path.abspath("/investing_proj/scrape_articles")
+# sys.path.append(project_root)
+# print(sys.path)
+
+# ✅ use package-relative imports (no collisions, no path hacks)
+from .news_api_GNews import fetch_gnews as _fetch_gnews
+from .newsapi import fetch_newsapi as _fetch_newsapi   # renamed file
+from .rss_basic import fetch_company_news as _fetch_rss
+
 
 
 # ————————————————————————————————————————————————————————————————————————————
@@ -206,3 +216,5 @@ def fetch_all_news(
 # extra_terms=["GPU","AI"] → bias toward product/technology context.
 #
 # They’re optional. If you don’t supply them, the query is just company + synonyms + tickers.
+
+

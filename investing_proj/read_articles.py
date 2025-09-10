@@ -589,46 +589,6 @@ def preview_article(res: Dict, row_number: int = 1, preview_chars: int = 400):
 
 
 
-########### Example
-
-# 1) Enrich your existing `res` dict in place
-res = enrich_res_with_text(res, max_workers=16, use_playwright=True, print_text=False)
-
-# 2) Access the text of each item
-for provider, pdata in res.get("providers", {}).items():
-    for it in pdata.get("items", []):
-        print(provider, "=>", it.get("title"), "=>", len(it.get("text","")), "chars")
-
-
-
-
-
-
-res = enrich_res_with_text(res, max_workers=16, use_playwright=True) # dict_keys(['company', 'attempted', 'ok', 'errors', 'providers', 'merged'])
-
-
-i = 20
-provider = "google_news_rss" # google_news_rss, gnews, newsapi
-entry = res['providers'][provider]['items'][i]
-
-print(entry)
-print(f"len: {len(entry['text'])} chars")
-
-# Step 2: Access text
-for provider, pdata in res.get("providers", {}).items():
-    for item in pdata.get("items", []):
-        title = item.get("title")
-        url = item.get("url")
-        text = item.get("text", "")
-        print("===")
-        print("Provider :", provider)
-        print("Title    :", title)
-        print("URL      :", url)
-        print("Text     :", text[:400], "..." if len(text) > 400 else "")
-
-
-
-
 # --- DataFrame helpers (drop these into the same file) ---
 import pandas as pd
 
@@ -677,8 +637,3 @@ def res_to_dataframe(res: dict,
         df = df[df["text"].astype(str).str.strip().ne("")].reset_index(drop=True)
 
     return df
-
-
-
-
-
