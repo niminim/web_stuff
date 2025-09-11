@@ -482,7 +482,7 @@ if __name__ == "__main__":
 
     print(f"\nSaved data for {len(all_rows)} tickers to {out_csv}")
 
-# no specific need for using this wrapper, could use scrape_tickers only.
-# this one is just more straight-forward
-ticker = 'CRSR'
-main_scores, other_indicators = get_financial_data_for_ticker(ticker, print_all_data=True)
+    # no specific need for using this wrapper, could use scrape_tickers only.
+    # this one is just more straight-forward
+    ticker = 'CRSR'
+    main_scores, other_indicators = get_financial_data_for_ticker(ticker, print_all_data=True)

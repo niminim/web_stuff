@@ -1,10 +1,12 @@
 # streamlit_gf_app.py
 """
-GuruFocus Scores — Streamlit dashboard (max 5 tickers)
+GuruFocus Scores — Streamlit dashboard (max 6 tickers)
 
-- Enter 1–5 tickers
-- Show companies SIDE-BY-SIDE as tables (wide-friendly, scrollable)
-- Main Scores (text) + selected 'Other Indicators'
+- Enter 1–6 tickers
+- Two aligned, side-by-side tables with a single header row:
+    1) Main Scores   (header: Metric/Ticker + tickers)
+    2) Other Indicators (header: Indicator/Ticker + tickers)
+- FIXED column widths (px) and FIXED font sizes (px), defined in code
 - CSV downloads for both tables
 """
 
@@ -19,6 +21,7 @@ for p in (ROOT_PROJECT, ROOT_PACKAGE):
 # ---------------------------------------------------------------------------------------
 
 import re
+import html
 from collections import OrderedDict
 from typing import Dict, List
 
@@ -31,19 +34,41 @@ try:
 except Exception:  # noqa: BLE001
     from scrape_fin_data.gf_analyze_ticker import get_financial_data_for_ticker  # type: ignore
 
+# ----------------------------- FIXED SIZES (px) -----------------------------
+LABEL_COL_PX = 200                 # "Metric/Ticker" / "Indicator/Ticker" column width
+TICKER_COL_PX = 100                # each ticker column width
+MAIN_FONT_PX  = 18                 # Main Scores table font size
+OTHER_FONT_PX = 15                 # Other Indicators table font size
+# ---------------------------------------------------------------------------
+
 # ----------------------------- Page setup + blue background -----------------------------
 st.set_page_config(page_title="GuruFocus Scores Dashboard", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
+/* Blue background */
 .stApp, [data-testid="stAppViewContainer"] { background: #e8f1ff; }
 [data-testid="stSidebar"] > div:first-child { background: rgba(255,255,255,0.75); backdrop-filter: blur(6px); }
 [data-testid="stHeader"] { background: transparent; }
+
+/* Base table styling (shared) */
+.aligned-table { border-collapse: collapse; table-layout: fixed; width: max-content; }
+.aligned-table th, .aligned-table td {
+  text-align: left; padding: 6px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+}
+.aligned-table thead th { position: sticky; top: 0; background: rgba(255,255,255,0.9); }
+
+/* Scroll wrapper to avoid overflowing the page */
+.table-scroll { overflow-x: auto; }
+
+/* Ensure tables don't break layout */
+.block-container { padding-top: 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📊 GuruFocus Main Scores — Quick Dashboard")
 
-# ----------------------------- Sidebar controls -----------------------------
+# ----------------------------- Sidebar controls (no size toggles) -----------------------------
 with st.sidebar:
     st.markdown("### Settings")
     headless = st.toggle(
@@ -52,44 +77,83 @@ with st.sidebar:
         help="Scraper uses requests first; Playwright only if needed."
     )
     show_other_indicators = st.toggle("Show 'Other Indicators' table", value=True)
-    st.caption("Tip: Enter up to 5 tickers (comma or space separated).")
+    st.caption("Tip: Enter up to 6 tickers (comma or space separated).")
 
 # ----------------------------- Helpers -----------------------------
-def normalize_tickers(raw: str, max_n: int = 5):
+def normalize_tickers(raw: str, max_n: int = 6):
     """Split on commas/whitespace, uppercase, de-dup (preserve order), cap to max_n."""
     parts = re.split(r"[,\s]+", raw)
     dedup, seen = [], set()
     for p in parts:
         t = p.strip().upper()
         if t and t not in seen:
-            seen.add(t)
-            dedup.append(t)
+            seen.add(t); dedup.append(t)
     truncated = len(dedup) > max_n
     return dedup[:max_n], truncated
-
-def _parse_score_to_num(s: str) -> float | None:
-    """Parse '7/10' or '85/100' into a 0–10 float for comparison; None on failure."""
-    if not isinstance(s, str):
-        return None
-    s = s.strip()
-    m10 = re.match(r"^\s*(\d+(?:\.\d+)?)\s*/\s*10\s*$", s)
-    m100 = re.match(r"^\s*(\d+(?:\.\d+)?)\s*/\s*100\s*$", s)
-    if m10:
-        try:
-            return float(m10.group(1))
-        except ValueError:
-            return None
-    if m100:
-        try:
-            return round(float(m100.group(1)) / 10.0, 2)
-        except ValueError:
-            return None
-    return None
 
 @st.cache_data(show_spinner=False)
 def fetch_one(ticker: str, headless_flag: bool):
     """Cached wrapper to keep Streamlit snappy."""
     return get_financial_data_for_ticker(ticker, headless=headless_flag, print_all_data=False)
+
+def inject_fixed_css(n_tickers: int):
+    """
+    Apply FIXED pixel widths & fixed font sizes to BOTH tables (keeps them aligned):
+      - Column 1 (Metric/Ticker or Indicator/Ticker) uses LABEL_COL_PX
+      - Each ticker column uses TICKER_COL_PX
+      - Main/Other tables use their fixed font sizes (px)
+    """
+    lines = [
+        f".main-scores-table {{ font-size: {MAIN_FONT_PX}px; }}",
+        f".other-table {{ font-size: {OTHER_FONT_PX}px; }}",
+        # First (label) column width for both tables:
+        f".main-scores-table thead th:nth-child(1), .main-scores-table tbody th, "
+        f".main-scores-table tbody td:nth-child(1) "
+        f"{{ width:{LABEL_COL_PX}px; min-width:{LABEL_COL_PX}px; max-width:{LABEL_COL_PX}px; }}",
+        f".other-table thead th:nth-child(1), .other-table tbody th, "
+        f".other-table tbody td:nth-child(1) "
+        f"{{ width:{LABEL_COL_PX}px; min-width:{LABEL_COL_PX}px; max-width:{LABEL_COL_PX}px; }}",
+    ]
+    # Ticker columns (same width on both tables)
+    # +1: because the first column is the label; header uses thead nth-child; body uses td nth-child
+    for i in range(2, n_tickers + 2):  # 1..(1+n_tickers)
+        lines.append(
+            f".main-scores-table thead th:nth-child({i}), .main-scores-table tbody td:nth-child({i}) "
+            f"{{ width:{TICKER_COL_PX}px; min-width:{TICKER_COL_PX}px; max-width:{TICKER_COL_PX}px; }}"
+        )
+        lines.append(
+            f".other-table thead th:nth-child({i}), .other-table tbody td:nth-child({i}) "
+            f"{{ width:{TICKER_COL_PX}px; min-width:{TICKER_COL_PX}px; max-width:{TICKER_COL_PX}px; }}"
+        )
+    st.markdown("<style>\n" + "\n".join(lines) + "\n</style>", unsafe_allow_html=True)
+
+def df_to_single_header_html(df: pd.DataFrame, label_header: str, table_classes: str, wrap_class: str = "table-scroll") -> str:
+    """
+    Render a DataFrame to HTML with a SINGLE header row:
+      <th>{label_header}</th> + one <th> per ticker,
+    and the first column in the body is the row label (scope='row').
+    """
+    # Columns are tickers
+    tickers = list(df.columns)
+    # Rows are metrics/indicators
+    row_labels = [str(i) for i in df.index.tolist()]
+
+    # Build thead (single row)
+    thead_cells = ['<th scope="col">{}</th>'.format(html.escape(label_header))]
+    thead_cells += ['<th scope="col">{}</th>'.format(html.escape(str(t))) for t in tickers]
+    thead_html = "<thead><tr>{}</tr></thead>".format("".join(thead_cells))
+
+    # Build tbody
+    body_rows = []
+    for r_label in row_labels:
+        row_html = ['<th scope="row">{}</th>'.format(html.escape(r_label))]
+        values = df.loc[r_label].tolist()
+        row_html += ['<td>{}</td>'.format(html.escape("" if v is None else str(v))) for v in values]
+        body_rows.append("<tr>{}</tr>".format("".join(row_html)))
+    tbody_html = "<tbody>{}</tbody>".format("".join(body_rows))
+
+    table_html = f'<table class="aligned-table {table_classes}">{thead_html}{tbody_html}</table>'
+    return f'<div class="{wrap_class}">{table_html}</div>'
 
 # ----- Whitelist & filtering for 'Other Indicators' -----
 WHITELIST_OTHER = [
@@ -151,18 +215,18 @@ def filter_other_indicators(other: Dict[str, str]) -> "OrderedDict[str, str]":
     return out
 
 # ----------------------------- Main UI -----------------------------
-st.markdown("Enter **1–5 tickers** and click **Run**:")
+st.markdown("Enter **1–6 tickers** and click **Run**:")
 
-tickers_input = st.text_input("Ticker(s)", value="NVDA", help="Enter up to 5 tickers.")
+tickers_input = st.text_input("Ticker(s)", value="NVDA", help="Enter up to 6 tickers.")
 run = st.button("Run")
 
 if run:
-    tickers, truncated = normalize_tickers(tickers_input, max_n=5)
+    tickers, truncated = normalize_tickers(tickers_input, max_n=6)
     if not tickers:
-        st.warning("Please enter 1–5 tickers.")
+        st.warning("Please enter 1–6 tickers.")
         st.stop()
     if truncated:
-        st.info(f"Using only the first 5 tickers: {', '.join(tickers)}")
+        st.info(f"Using only the first 6 tickers: {', '.join(tickers)}")
 
     # ---------------- Fetch all tickers ----------------
     fetched: Dict[str, Dict[str, Dict[str, str]]] = {}
@@ -180,8 +244,8 @@ if run:
     if not fetched:
         st.stop()
 
-    # ---------------- Build 'Main Scores' table (side-by-side) ----------------
-    # Map scraper keys -> pretty labels
+    # ---------------- Build dataframes ----------------
+    # Main Scores
     metric_map = [
         ("financial_str", "Financial Strength"),
         ("profit",        "Profitability Rank"),
@@ -190,40 +254,51 @@ if run:
         ("gf_value",      "GF Value Rank"),
         ("GF_score",      "GF Score"),
     ]
-
-    # Text version (7/10, 85/100, etc.)
-    main_rows_text = []
+    main_rows = []
     for key, label in metric_map:
-        row = {"Metric": label}
+        row = {"Metric/Ticker": label}
         for tk in tickers:
-            val = fetched.get(tk, {}).get("main", {}).get(key, "—")
-            row[tk] = val
-        main_rows_text.append(row)
-    df_main_text = pd.DataFrame(main_rows_text).set_index("Metric")
+            row[tk] = fetched.get(tk, {}).get("main", {}).get(key, "—")
+        main_rows.append(row)
+    df_main = pd.DataFrame(main_rows).set_index("Metric/Ticker")
 
-    st.subheader("Main Scores (text)")
-    st.dataframe(df_main_text, use_container_width=True)
+    # Other Indicators
+    other_rows = []
+    for indicator in WHITELIST_OTHER:
+        row = {"Indicator/Ticker": indicator}
+        for tk in tickers:
+            filtered = filter_other_indicators(fetched.get(tk, {}).get("other", {}))
+            row[tk] = filtered.get(indicator, "—")
+        other_rows.append(row)
+    df_other = pd.DataFrame(other_rows).set_index("Indicator/Ticker")
+
+    # ---------------- Apply FIXED sizes (px) & render ----------------
+    inject_fixed_css(n_tickers=len(tickers))
+
+    # Main Scores
+    st.subheader("Main Scores")
+    main_html = df_to_single_header_html(
+        df_main,
+        label_header="Metric/Ticker",
+        table_classes="main-scores-table",
+    )
+    st.markdown(main_html, unsafe_allow_html=True)
     st.download_button(
-        "Download Main Scores (text) CSV",
-        data=df_main_text.to_csv().encode("utf-8"),
-        file_name="main_scores_text.csv",
+        "Download Main Scores CSV",
+        data=df_main.to_csv().encode("utf-8"),
+        file_name="main_scores.csv",
         mime="text/csv",
     )
 
-    # ---------------- Build 'Other Indicators' table (side-by-side) ----------------
+    # Other Indicators
     if show_other_indicators:
-        other_rows = []
-        # Start with whitelist order
-        for indicator in WHITELIST_OTHER:
-            row = {"Indicator": indicator}
-            for tk in tickers:
-                filtered = filter_other_indicators(fetched.get(tk, {}).get("other", {}))
-                row[tk] = filtered.get(indicator, "—")
-            other_rows.append(row)
-        df_other = pd.DataFrame(other_rows).set_index("Indicator")
-
-        st.subheader("Other Indicators (selected)")
-        st.dataframe(df_other, use_container_width=True)
+        st.subheader("Other Indicators")
+        other_html = df_to_single_header_html(
+            df_other,
+            label_header="Indicator/Ticker",
+            table_classes="other-table",
+        )
+        st.markdown(other_html, unsafe_allow_html=True)
         st.download_button(
             "Download Other Indicators CSV",
             data=df_other.to_csv().encode("utf-8"),
