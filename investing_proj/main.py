@@ -24,8 +24,8 @@ def main():
     synonyms: List[str] = ["NVIDIA Corporation"]
 
     # Prefer env vars over hardcoding
-    gnews_token = os.getenv("GNEWS_TOKEN") or "a0a597344c0c69d79f50ddb483743b7f"   # dev fallback
-    newsapi_key = os.getenv("NEWSAPI_KEY") or "61b3e308bbf043789e83e53288f294be"   # dev fallback
+    gnews_token = os.getenv("GNEWS_TOKEN") or "'TOKEN'"   # dev fallback
+    newsapi_key = os.getenv("NEWSAPI_KEY") or "TOKEN"   # dev fallback
 
     # --- fetch ---
     res = fetch_all_news(
